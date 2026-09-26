@@ -11,43 +11,42 @@
 stages:
   - test
 
-# TEMPORARY (AGENTD-001). Established so far: a job whose script is only
-# `echo` SUCCEEDS, whether or not it inherits default.cache / default.image /
-# default.before_script. A job that runs Go FAILS with "exit code 1" even when
-# every line ends in an echo — rc-build=0, rc-test=0, rc-vet=0, rc-race=0,
-# "script end" printed, disk 32%. These two split it further. Remove once known.
-smoke-goversion:
-  stage: test
-  cache: []
-  before_script: []
-  script:
-    - go version
-    - echo "goversion end"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
-smoke-gobuild:
+# TEMPORARY (AGENTD-001). Established: `echo`-only jobs pass; `go version` and
+# `go build` pass; a job that also runs `go test`/`go vet` fails with exit code
+# 1 even though every command reported 0 and the last line printed. These three
+# split it by what is executed. Remove once known.
+smoke-vet:
   stage: test
   cache: []
   before_script: []
   script:
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
-    - go build ./...
-    - echo "gobuild end"
+    - go build ./... && go vet ./...
+    - echo "vet end"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
-smoke-exit0:
+smoke-test-tmux:
   stage: test
   cache: []
   before_script: []
   script:
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
-    - go build ./...
-    - echo "exit0 end"
-    - exit 0
+    - go test ./internal/infra/tmux/ -count=1
+    - echo "test-tmux end"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+smoke-test-rest:
+  stage: test
+  cache: []
+  before_script: []
+  script:
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+    - go test ./internal/domain/... ./internal/application/... ./internal/core/... ./internal/handler/... ./internal/archtest/... ./internal/infra/tokenauth/ ./internal/infra/hostfs/ -count=1
+    - echo "test-rest end"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
