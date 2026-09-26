@@ -11,25 +11,43 @@
 stages:
   - test
 
-# TEMPORARY (AGENTD-001): the real jobs run every command successfully — the
-# last one prints — and still end "exit code 1". Probes so far: alpine+no cache
-# SUCCEEDS; inheriting default.cache, default.image and default.before_script
-# each SUCCEED. The remaining difference is that the real jobs run Go. This one
-# ends every line with an echo, so the script CANNOT return non-zero — if it
-# still fails, the cause is after the script. Remove once known.
-smoke-go:
+# TEMPORARY (AGENTD-001). Established so far: a job whose script is only
+# `echo` SUCCEEDS, whether or not it inherits default.cache / default.image /
+# default.before_script. A job that runs Go FAILS with "exit code 1" even when
+# every line ends in an echo — rc-build=0, rc-test=0, rc-vet=0, rc-race=0,
+# "script end" printed, disk 32%. These two split it further. Remove once known.
+smoke-goversion:
   stage: test
   cache: []
   before_script: []
   script:
-    - export GOPATH="$CI_PROJECT_DIR/.gopath"; export PATH="$GOPATH/bin:$PATH"
-    - df -h /builds /tmp | tail -3
-    - go build ./...; echo "rc-build=$?"
-    - go test ./... -count=1; echo "rc-test=$?"
-    - go vet ./...; echo "rc-vet=$?"
-    - go test -race ./... -count=1; echo "rc-race=$?"
-    - df -h /builds /tmp | tail -3
-    - echo "smoke-go script end"
+    - go version
+    - echo "goversion end"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+smoke-gobuild:
+  stage: test
+  cache: []
+  before_script: []
+  script:
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+    - go build ./...
+    - echo "gobuild end"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+smoke-exit0:
+  stage: test
+  cache: []
+  before_script: []
+  script:
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+    - go build ./...
+    - echo "exit0 end"
+    - exit 0
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
