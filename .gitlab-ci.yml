@@ -12,7 +12,11 @@ stages:
   - test
 
 default:
-  image: golang:1.24
+  # MUST track go.mod's `go` directive. The image was golang:1.24 against a
+  # go.mod asking for 1.25.0, and with GOTOOLCHAIN=local in the image that is an
+  # instant `go: go.mod requires go >= 1.25.0` — every pipeline on this branch
+  # failed on its first command while the local gates were green.
+  image: golang:1.25
   before_script:
     # GOPATH inside the project so CI can cache it; .gitignore already hides it,
     # because an untracked directory makes the tree dirty and GoReleaser then
@@ -46,7 +50,7 @@ test:
 # this is the only job in the repo with a runtime dependency.
 test:tmux:
   stage: test
-  image: golang:1.24
+  image: golang:1.25
   before_script:
     - apt-get update -qq && apt-get install -y -qq tmux >/dev/null
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
