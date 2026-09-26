@@ -11,21 +11,6 @@
 stages:
   - test
 
-# TEMPORARY (AGENTD-001) — confirmation run for the cause found by bisection:
-# a unit test sent SIGTERM to pid 1, which in a container is the job's own
-# shell. Kept for one pipeline to prove the fix, then removed.
-smoke-test-tmux:
-  stage: test
-  cache: []
-  before_script: []
-  script:
-    - export GOPATH="$CI_PROJECT_DIR/.gopath"
-    - go test ./internal/infra/tmux/ -count=1
-    - echo "test-tmux end"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
 default:
   # MUST track go.mod's `go` directive. The image was golang:1.24 against a
   # go.mod asking for 1.25.0, and with GOTOOLCHAIN=local in the image that is an
