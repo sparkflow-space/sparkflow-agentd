@@ -113,12 +113,23 @@ func TestCLISignalKill_IsIdempotent(t *testing.T) {
 
 func TestCLISignal_TermIsARealSignalNotCtrlD(t *testing.T) {
 	d := newFakeDir(t)
-	d.write("pane", "1") // display-message answers with a pid for this call
+	// display-message answers with something that is NOT a pid, so signalPane
+	// refuses before it sends anything. This test asserts WHICH tmux call is
+	// made, not that a signal lands — and a unit test must never deliver a real
+	// signal to a pid it did not create.
+	//
+	// The first version wrote "1" here, reasoning that pid 1 is not ours to
+	// signal. On a developer box that is true: the kernel discards a signal to
+	// init. Inside a CI container pid 1 is the JOB'S OWN SHELL, and SIGTERM to
+	// it made every pipeline fail with "exit code 1" after a script whose every
+	// command had succeeded — six pipelines of bisection to find, because the
+	// test itself reported ok.
+	d.write("pane", "not-a-pid")
 	cli := tmux.NewCLI(d.bin())
 
-	// pid 1 is not ours to signal, so this fails — the point is WHICH tmux call
-	// was made: a pane_pid lookup, not a send-keys C-d.
-	_ = cli.Signal(context.Background(), sample(), session.SignalTerm)
+	if err := cli.Signal(context.Background(), sample(), session.SignalTerm); err == nil {
+		t.Error("a pane whose pid cannot be read must be an error, not a silent no-op")
+	}
 	calls := d.read("calls")
 	if !strings.Contains(calls, "#{pane_pid}") {
 		t.Errorf("TERM must resolve the pane's pid:\n%s", calls)

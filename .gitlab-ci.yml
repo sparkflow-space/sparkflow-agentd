@@ -11,13 +11,9 @@
 stages:
   - test
 
-# TEMPORARY (AGENTD-001) — the last probe. Bisection: echo-only jobs pass;
-# `go version`, `go build` and `go vet` pass; `go test` of every package EXCEPT
-# internal/infra/tmux passes; `go test ./internal/infra/tmux/` FAILS the job
-# even though the test itself reports ok and the last line prints. That package
-# is the only one that spawns processes (its fake tmux is the test binary
-# re-executed), so the suspect is an orphaned child outliving the job. `ps`
-# below is the measurement; the fix is in attach(). Remove once confirmed.
+# TEMPORARY (AGENTD-001) — confirmation run for the cause found by bisection:
+# a unit test sent SIGTERM to pid 1, which in a container is the job's own
+# shell. Kept for one pipeline to prove the fix, then removed.
 smoke-test-tmux:
   stage: test
   cache: []
@@ -25,8 +21,6 @@ smoke-test-tmux:
   script:
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
     - go test ./internal/infra/tmux/ -count=1
-    - echo "--- processes still alive after the test:"
-    - ps -ef
     - echo "test-tmux end"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
