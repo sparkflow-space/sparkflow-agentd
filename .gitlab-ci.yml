@@ -11,6 +11,20 @@
 stages:
   - test
 
+# TEMPORARY (AGENTD-001): both real jobs run every command successfully — the
+# last one prints — and the job still ends "exit code 1". This isolates whether
+# that comes from anything we wrote. Remove once the cause is known.
+smoke:
+  stage: test
+  image: alpine:3.20
+  cache: []
+  before_script: []
+  script:
+    - echo smoke-ok
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 default:
   # MUST track go.mod's `go` directive. The image was golang:1.24 against a
   # go.mod asking for 1.25.0, and with GOTOOLCHAIN=local in the image that is an
