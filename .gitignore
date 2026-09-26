@@ -1,0 +1,13 @@
+bin/
+
+# GoReleaser build output.
+dist/
+
+# CI puts GOPATH inside the project dir for caching.
+.gopath/
+
+# A bare `go build ./cmd/sparkflow-agentd` writes the binary HERE, at the repo root,
+# where /bin/ and /dist/ rules do not look. Anchored on purpose: a bare
+# `sparkflow-agentd` would also ignore the source dir of the same name
+# (cmd/sparkflow-agentd). See docs CLAUDE.md, TENANCY-030, WIKI-230.
+/sparkflow-agentd
