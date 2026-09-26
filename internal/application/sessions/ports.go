@@ -10,13 +10,6 @@ import (
 	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 )
 
-// Chunk is one piece of decoded output, in order.
-type Chunk struct {
-	Seq  uint64
-	Data []byte
-	At   time.Time
-}
-
 // Tmux is everything the daemon needs from tmux. Implemented by
 // internal/infra/tmux; faked in tests, which is why the whole use-case layer
 // can be tested without tmux installed.
@@ -29,7 +22,7 @@ type Tmux interface {
 	List(ctx context.Context) ([]string, error)
 	// Subscribe delivers output from `from` onward until ctx is done. The
 	// implementation owns buffering and replay; the use case only forwards.
-	Subscribe(ctx context.Context, name string, from uint64) (<-chan Chunk, error)
+	Subscribe(ctx context.Context, name string, from uint64) (<-chan session.Chunk, error)
 }
 
 // Audit records who did what. A CLI agent can delete a repository; the log is

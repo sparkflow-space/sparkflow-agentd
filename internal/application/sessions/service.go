@@ -101,7 +101,7 @@ func (s *Service) Snapshot(ctx context.Context, id string, lines int) (string, e
 	return s.tmux.Capture(ctx, sess.TmuxName, lines)
 }
 
-func (s *Service) Subscribe(ctx context.Context, id string, from uint64) (<-chan Chunk, error) {
+func (s *Service) Subscribe(ctx context.Context, id string, from uint64) (<-chan session.Chunk, error) {
 	sess, err := s.get(id)
 	if err != nil {
 		return nil, err

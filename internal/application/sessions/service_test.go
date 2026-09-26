@@ -47,8 +47,8 @@ func (f *fakeTmux) Kill(_ context.Context, name string) error {
 	return nil
 }
 func (f *fakeTmux) List(context.Context) ([]string, error) { return f.list, nil }
-func (f *fakeTmux) Subscribe(context.Context, string, uint64) (<-chan sessions.Chunk, error) {
-	ch := make(chan sessions.Chunk)
+func (f *fakeTmux) Subscribe(context.Context, string, uint64) (<-chan session.Chunk, error) {
+	ch := make(chan session.Chunk)
 	close(ch)
 	return ch, nil
 }

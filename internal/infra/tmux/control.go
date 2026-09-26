@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sparkflow-space/sparkflow-agentd/internal/application/sessions"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 )
 
@@ -41,25 +40,25 @@ func NewControl(bin string, bufSize int) *Control {
 // however many subscribers are watching that session.
 type stream struct {
 	mu   sync.Mutex
-	ring []sessions.Chunk // bounded history, so a reconnecting client can catch up
+	ring []session.Chunk // bounded history, so a reconnecting client can catch up
 	max  int
 	next uint64
-	subs map[chan sessions.Chunk]uint64 // subscriber → next seq it wants
+	subs map[chan session.Chunk]uint64 // subscriber → next seq it wants
 	stop func()
 	done chan struct{}
 }
 
 // Subscribe delivers everything from `from` that is still buffered, then live
 // output, until ctx is done.
-func (c *Control) Subscribe(ctx context.Context, name string, from uint64) (<-chan sessions.Chunk, error) {
+func (c *Control) Subscribe(ctx context.Context, name string, from uint64) (<-chan session.Chunk, error) {
 	s, err := c.streamFor(name)
 	if err != nil {
 		return nil, err
 	}
-	ch := make(chan sessions.Chunk, 256)
+	ch := make(chan session.Chunk, 256)
 
 	s.mu.Lock()
-	backlog := make([]sessions.Chunk, 0, len(s.ring))
+	backlog := make([]session.Chunk, 0, len(s.ring))
 	for _, ck := range s.ring {
 		if ck.Seq >= from {
 			backlog = append(backlog, ck)
@@ -141,7 +140,7 @@ func (c *Control) attach(name string) (*stream, error) {
 	}
 	s := &stream{
 		max:  c.bufSize,
-		subs: map[chan sessions.Chunk]uint64{},
+		subs: map[chan session.Chunk]uint64{},
 		stop: func() { _ = stdin.Close(); cancel() },
 		done: make(chan struct{}),
 	}
@@ -166,11 +165,11 @@ func (s *stream) read(stdout io.ReadCloser, cmd *exec.Cmd) {
 			// resize) are not errors and are ignored on purpose.
 			continue
 		}
-		s.publish(sessions.Chunk{Data: session.DecodeOutput(ev.Payload), At: time.Now()})
+		s.publish(session.Chunk{Data: session.DecodeOutput(ev.Payload), At: time.Now()})
 	}
 }
 
-func (s *stream) publish(ck sessions.Chunk) {
+func (s *stream) publish(ck session.Chunk) {
 	s.mu.Lock()
 	ck.Seq = s.next
 	s.next++
@@ -178,7 +177,7 @@ func (s *stream) publish(ck sessions.Chunk) {
 	if len(s.ring) > s.max {
 		s.ring = s.ring[len(s.ring)-s.max:]
 	}
-	subs := make([]chan sessions.Chunk, 0, len(s.subs))
+	subs := make([]chan session.Chunk, 0, len(s.subs))
 	for ch := range s.subs {
 		subs = append(subs, ch)
 	}

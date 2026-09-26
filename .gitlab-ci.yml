@@ -1,0 +1,51 @@
+# One stage for now, deliberately.
+#
+# The publish track — mirror `main` and a tag to the GitHub repository, then let
+# GoReleaser build the binaries — is NOT wired here yet, because it needs two
+# things that do not exist: the public GitHub repository, and a deploy key in
+# this project's CI variables. Shipping a release job that has never run would
+# be worse than shipping none: the first real tag would discover it.
+# That work is AGENTD-002; sparkflow-sync's .gitlab-ci.yml is the model,
+# including the trap that GitLab strips a file variable's trailing newline and
+# OpenSSH then fails with `error in libcrypto`.
+stages:
+  - test
+
+default:
+  image: golang:1.24
+  before_script:
+    # GOPATH inside the project so CI can cache it; .gitignore already hides it,
+    # because an untracked directory makes the tree dirty and GoReleaser then
+    # refuses to release.
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+    - export PATH="$GOPATH/bin:$PATH"
+  cache:
+    key: "$CI_JOB_IMAGE"
+    paths: [.gopath/pkg/mod]
+
+test:
+  stage: test
+  script:
+    - go build ./...
+    - go test ./... -count=1
+    - test -z "$(gofmt -l .)" || { echo "gofmt:"; gofmt -l .; exit 1; }
+    - go vet ./...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# The tmux adapter's own test needs a real tmux, so it gets an image that has
+# one. Kept separate rather than merged into `test` to keep the reason visible:
+# this is the only job in the repo with a runtime dependency.
+test:tmux:
+  stage: test
+  image: golang:1.24
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq tmux >/dev/null
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"
+  script:
+    - tmux -V
+    - go test -tags tmux ./internal/infra/tmux/ -count=1
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
