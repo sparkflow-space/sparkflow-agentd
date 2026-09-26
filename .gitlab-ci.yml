@@ -32,7 +32,11 @@ test:
   script:
     - go build ./...
     - go test ./... -count=1
-    - test -z "$(gofmt -l .)" || { echo "gofmt:"; gofmt -l .; exit 1; }
+    # gofmt is pointed at OUR files, never at `.`: GOPATH lives inside the
+    # project so the runner can cache it, and `gofmt -l .` walks into
+    # .gopath/pkg/mod — where a dependency's own unformatted file
+    # (golang.org/x/net's http3/stream_test.go) failed this gate.
+    - unformatted=$(git ls-files '*.go' | xargs gofmt -l); test -z "$unformatted" || { echo "gofmt:"; echo "$unformatted"; exit 1; }
     - go vet ./...
     # A published module's go.mod must describe itself honestly: two direct
     # dependencies were marked `// indirect` until this gate existed.
@@ -57,6 +61,10 @@ test:tmux:
   script:
     - tmux -V
     - go test -race -tags tmux ./internal/infra/tmux/ -count=1
+    # A leaked session would otherwise be invisible: the test cleans up after
+    # itself, and this is the assertion that it did.
+    - if tmux ls 2>/dev/null | grep -q '^sfagent-'; then echo "leaked tmux sessions:"; tmux ls; exit 1; fi
+    - echo "tmux job complete"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH

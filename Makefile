@@ -24,8 +24,11 @@ tidy-check:
 	go mod tidy
 	git diff --exit-code go.mod go.sum
 
+# gofmt is pointed at tracked files, not at `.`: a GOPATH inside the project
+# (which CI uses for caching) would otherwise put a dependency's formatting in
+# our gate.
 gates:
-	go build ./... && go test ./... -count=1 && test -z "$$(gofmt -l .)" && go vet ./...
+	go build ./... && go test ./... -count=1 && test -z "$$(git ls-files '*.go' | xargs gofmt -l)" && go vet ./...
 	@echo "gates: OK"
 
 # The race detector is where the control-mode fan-out is actually proved: its

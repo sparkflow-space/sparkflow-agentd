@@ -372,8 +372,11 @@ func (s *stream) detached(sawExit bool) {
 	// error, and "the session is gone" is a different fact from "our pipe broke".
 	dead := !alreadyEnded && !s.c.alive(s.name)
 
-	if !dead {
-		// The session is alive and only our attach died. Put it back rather than
+	if !dead && !alreadyEnded {
+		// The session is alive and only our attach died (and nobody has released
+		// this stream in the meantime — after Close or Release there is nothing
+		// to go back to, and sleeping first would only delay the goroutine's
+		// exit). Put it back rather than
 		// ending the client's stream: the seq counter and the ring are on the
 		// stream, so a new attach resumes the numbering and the client never
 		// notices. Bounded, so an attach that cannot survive a second does not
