@@ -12,31 +12,24 @@ stages:
   - test
 
 # TEMPORARY (AGENTD-001): the real jobs run every command successfully — the
-# last one prints — and still end "exit code 1". `smoke` (alpine, no cache, no
-# inherited before_script) SUCCEEDED, so the cause is something the real jobs
-# inherit from `default`. These three isolate which part. Remove once known.
-smoke-cache:
-  stage: test
-  image: alpine:3.20
-  before_script: []
-  script: ["echo cache-probe"]      # inherits default.cache
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
-smoke-image:
+# last one prints — and still end "exit code 1". Probes so far: alpine+no cache
+# SUCCEEDS; inheriting default.cache, default.image and default.before_script
+# each SUCCEED. The remaining difference is that the real jobs run Go. This one
+# ends every line with an echo, so the script CANNOT return non-zero — if it
+# still fails, the cause is after the script. Remove once known.
+smoke-go:
   stage: test
   cache: []
   before_script: []
-  script: ["echo image-probe"]      # inherits default.image only
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
-smoke-before:
-  stage: test
-  cache: []
-  script: ["echo before-probe"]     # inherits default.image + before_script
+  script:
+    - export GOPATH="$CI_PROJECT_DIR/.gopath"; export PATH="$GOPATH/bin:$PATH"
+    - df -h /builds /tmp | tail -3
+    - go build ./...; echo "rc-build=$?"
+    - go test ./... -count=1; echo "rc-test=$?"
+    - go vet ./...; echo "rc-vet=$?"
+    - go test -race ./... -count=1; echo "rc-race=$?"
+    - df -h /builds /tmp | tail -3
+    - echo "smoke-go script end"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
