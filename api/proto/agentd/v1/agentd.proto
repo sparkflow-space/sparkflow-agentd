@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package agentd.v1;
+
+option go_package = "github.com/sparkflow-space/sparkflow-agentd/internal/generated/agentd/v1;agentdv1";
+
+// AgentDaemon owns CLI-agent sessions on a host: one tmux session per agent,
+// the bytes flowing through it, and nothing else. It knows no companies, no
+// projects and no permissions — the caller (the in-cluster agent-sessions
+// service) holds all of that and is the only thing that should.
+//
+// Every RPC requires a Zitadel JWT belonging to a PERSON, checked for
+// signature, expiry, issuer and audience. The daemon authenticates its caller;
+// it never authorises. See "CLI Agent Sessions" in the project vault.
+service AgentDaemon {
+  // Start opens a session. `kind` selects a binary from the daemon's own
+  // allow-list — a caller cannot pass a command line — and `workspace` must
+  // resolve under the configured root.
+  rpc Start(StartRequest) returns (StartResponse);
+  // Send types into the session. submit=false types without Enter, which is
+  // how a half-written prompt is staged.
+  rpc Send(SendRequest) returns (SendResponse);
+  // Stream pushes output as it appears, from `from_seq` onward. Backed by tmux
+  // control mode, so there is no polling.
+  rpc Stream(StreamRequest) returns (stream OutputChunk);
+  // Snapshot returns what is on the screen right now — what a reconnecting
+  // client paints before the stream resumes.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  // Signal is explicit rather than "send the escape sequence yourself": a CLI
+  // agent handles Ctrl-C meaningfully, and only an unresponsive one earns KILL.
+  rpc Signal(SignalRequest) returns (SignalResponse);
+  // List is also the reconciliation source of truth: tmux outlives the daemon,
+  // so after a restart the daemon re-adopts what is actually running.
+  rpc List(ListRequest) returns (ListResponse);
+}
+
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_STARTING = 1;
+  STATE_IDLE = 2;
+  STATE_WORKING = 3;
+  STATE_WAITING_INPUT = 4;
+  STATE_EXITED = 5;
+}
+
+enum Signal_ {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_INT = 1;   // Ctrl-C: let the agent flush and exit
+  SIGNAL_TERM = 2;
+  SIGNAL_KILL = 3;  // last resort; also kills the tmux session
+}
+
+message Session {
+  string id = 1;
+  string kind = 2;
+  string workspace = 3;
+  string tmux_name = 4;
+  State state = 5;
+  int64 created_at_unix = 6;
+  int64 last_activity_unix = 7;
+  int32 cols = 8;
+  int32 rows = 9;
+}
+
+message StartRequest {
+  string kind = 1;
+  string workspace = 2;
+  // env entries are "K=V". The daemon passes them to the agent process; it
+  // never interprets them.
+  repeated string env = 3;
+  int32 cols = 4;  // 0 ⇒ the daemon's default. A detached tmux session without
+  int32 rows = 5;  // an explicit size is 80x24, which breaks full-screen TUIs.
+}
+message StartResponse { Session session = 1; }
+
+message SendRequest {
+  string session_id = 1;
+  string text = 2;
+  bool submit = 3;
+}
+message SendResponse {}
+
+message StreamRequest {
+  string session_id = 1;
+  uint64 from_seq = 2;
+}
+
+// OutputChunk carries DECODED bytes: tmux control mode escapes them in octal
+// (\015\012, and UTF-8 as \321\202), and the daemon undoes that before anyone
+// downstream sees them.
+message OutputChunk {
+  uint64 seq = 1;
+  bytes data = 2;
+  int64 at_unix_nano = 3;
+}
+
+message SnapshotRequest {
+  string session_id = 1;
+  int32 lines = 2;  // 0 ⇒ the visible screen
+}
+message SnapshotResponse { string text = 1; }
+
+message SignalRequest {
+  string session_id = 1;
+  Signal_ signal = 2;
+}
+message SignalResponse {}
+
+message ListRequest {}
+message ListResponse { repeated Session sessions = 1; }
