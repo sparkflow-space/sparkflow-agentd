@@ -11,22 +11,13 @@
 stages:
   - test
 
-# TEMPORARY (AGENTD-001). Established: `echo`-only jobs pass; `go version` and
-# `go build` pass; a job that also runs `go test`/`go vet` fails with exit code
-# 1 even though every command reported 0 and the last line printed. These three
-# split it by what is executed. Remove once known.
-smoke-vet:
-  stage: test
-  cache: []
-  before_script: []
-  script:
-    - export GOPATH="$CI_PROJECT_DIR/.gopath"
-    - go build ./... && go vet ./...
-    - echo "vet end"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
+# TEMPORARY (AGENTD-001) — the last probe. Bisection: echo-only jobs pass;
+# `go version`, `go build` and `go vet` pass; `go test` of every package EXCEPT
+# internal/infra/tmux passes; `go test ./internal/infra/tmux/` FAILS the job
+# even though the test itself reports ok and the last line prints. That package
+# is the only one that spawns processes (its fake tmux is the test binary
+# re-executed), so the suspect is an orphaned child outliving the job. `ps`
+# below is the measurement; the fix is in attach(). Remove once confirmed.
 smoke-test-tmux:
   stage: test
   cache: []
@@ -34,19 +25,9 @@ smoke-test-tmux:
   script:
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
     - go test ./internal/infra/tmux/ -count=1
+    - echo "--- processes still alive after the test:"
+    - ps -ef
     - echo "test-tmux end"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH
-
-smoke-test-rest:
-  stage: test
-  cache: []
-  before_script: []
-  script:
-    - export GOPATH="$CI_PROJECT_DIR/.gopath"
-    - go test ./internal/domain/... ./internal/application/... ./internal/core/... ./internal/handler/... ./internal/archtest/... ./internal/infra/tokenauth/ ./internal/infra/hostfs/ -count=1
-    - echo "test-rest end"
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH

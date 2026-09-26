@@ -221,11 +221,31 @@ func (s *stream) ensureAttached() error {
 
 func (s *stream) attach() error {
 	ctx, cancel := context.WithCancel(context.Background())
+	// The cancel is published BEFORE the process starts, and that ordering is
+	// the fix for a real orphan. It used to be assigned after cmd.Start(), so a
+	// Close landing in that window could not reach the process: the attach was
+	// never killed and outlived the daemon. In CI it outlived the JOB — the
+	// runner then reported "exit code 1" for a script whose every command had
+	// succeeded and whose last line had printed, which took six pipelines to
+	// pin down. Cancelling before Start is harmless: Start then fails with
+	// "context canceled" and the error path below clears the state.
+	s.mu.Lock()
+	s.cancel = cancel
+	s.mu.Unlock()
+	fail := func(err error) error {
+		cancel()
+		s.mu.Lock()
+		s.cancel = nil
+		s.mu.Unlock()
+		return err
+	}
+
 	cmd := exec.CommandContext(ctx, s.c.bin, "-C", "attach", "-t", exact(s.name))
+	// Wait must not block forever on a pipe some descendant still holds open.
+	cmd.WaitDelay = 5 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		cancel()
-		return err
+		return fail(err)
 	}
 	// Hold stdin open for the life of the attach. A control-mode client reads
 	// commands from stdin and exits on EOF — with stdin left at /dev/null it
@@ -233,8 +253,7 @@ func (s *stream) attach() error {
 	// exactly how this failed the first time it ran.
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		cancel()
-		return err
+		return fail(err)
 	}
 	// tmux's own complaints go somewhere readable rather than to /dev/null: an
 	// attach that dies for a reason nobody logged is the hardest kind of hang to
@@ -242,12 +261,11 @@ func (s *stream) attach() error {
 	var errb syncBuffer
 	cmd.Stderr = &errb
 	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("tmux -C attach -t %s: %w", s.name, err)
+		return fail(fmt.Errorf("tmux -C attach -t %s: %w", s.name, err))
 	}
 
 	s.mu.Lock()
-	s.cancel, s.stdin, s.attachedAt = cancel, stdin, time.Now()
+	s.stdin, s.attachedAt = stdin, time.Now()
 	s.mu.Unlock()
 
 	if s.paneUnknown() {

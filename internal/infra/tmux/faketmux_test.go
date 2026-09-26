@@ -150,8 +150,17 @@ func runScript(dir string) int {
 			w.Flush()
 			return 0
 		case "hold":
+			// What a real control-mode client does: sit there until stdin
+			// closes. Bounded, because a fake that outlives the test run is a
+			// process holding the CI job's stdout — which is exactly how the
+			// orphan in attach() showed up.
 			w.Flush()
-			_, _ = io.Copy(io.Discard, os.Stdin)
+			done := make(chan struct{})
+			go func() { _, _ = io.Copy(io.Discard, os.Stdin); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Minute):
+			}
 			return 0
 		}
 	}
