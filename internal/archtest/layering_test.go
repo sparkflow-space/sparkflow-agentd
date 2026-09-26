@@ -111,6 +111,17 @@ func judge(module, fileLayer, imp string) string {
 		if internal && (impLayer == "application" || impLayer == "handler") {
 			return "infra implements domain ports and must not import application or handler"
 		}
+	case "handler":
+		// The missing half of the chain. Handler → Application → Domain says
+		// nothing about handler → INFRA, and without this case a handler file
+		// could import any adapter it liked and the gate would stay green — as
+		// one did here, defining its Verifier port in terms of an infra struct,
+		// which then forced every implementation AND every test stub to import
+		// infra too. Wiring belongs to the composition root (internal/core,
+		// cmd/*), which this checker deliberately does not judge.
+		if internal && impLayer == "infra" {
+			return "handler must not import infra — declare a port in terms of domain (or handler) types and let the composition root inject the adapter"
+		}
 	}
 	return ""
 }
@@ -240,6 +251,7 @@ func TestCheckerReportsPlantedViolations(t *testing.T) {
 		"internal/infra/db/db.go":            "package db\nimport _ \"example.com/svc/internal/application/order\"\n",
 		"internal/infra/db/handler.go":       "package db\nimport _ \"example.com/svc/internal/handler/http\"\n",
 		"internal/infra/db/cli.go":           "package db\nimport _ \"example.com/svc/internal/cli\"\n",
+		"internal/handler/http/bad.go":       "package http\nimport _ \"example.com/svc/internal/infra/db\"\n",
 		// ok.go is the NEGATIVE control: a file the checker must NOT flag. Its
 		// third import is drawn from applicationThirdParty when that list has
 		// an entry, and omitted when it is empty — this repo's list is empty on
@@ -262,6 +274,7 @@ func TestCheckerReportsPlantedViolations(t *testing.T) {
 		"internal/infra/db/db.go":            "example.com/svc/internal/application/order",
 		"internal/infra/db/handler.go":       "example.com/svc/internal/handler/http",
 		"internal/infra/db/cli.go":           "example.com/svc/internal/cli",
+		"internal/handler/http/bad.go":       "example.com/svc/internal/infra/db",
 	}
 	if len(got) != len(want) {
 		t.Errorf("got %d violations, want %d:\n%v", len(got), len(want), got)

@@ -15,13 +15,16 @@ import (
 	"github.com/sparkflow-space/sparkflow-agentd/internal/application/sessions"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 	agentdv1 "github.com/sparkflow-space/sparkflow-agentd/internal/generated/agentd/v1"
-	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/tokenauth"
 )
 
-// Verifier is the port the interceptors need. Defined here, at the consumer,
-// so the handler can be tested with a stub.
+// Verifier is the port the interceptors need. Defined here, at the consumer, so
+// the handler can be tested with a stub.
+//
+// It speaks the DOMAIN's Actor: a handler port returning an infra type would
+// force every implementation and every test stub to import infra, which is the
+// one edge this layering forbids and the layering test does not see.
 type Verifier interface {
-	Verify(raw string) (tokenauth.Actor, error)
+	Verify(raw string) (session.Actor, error)
 }
 
 // Logger keeps the handler free of a logging library.
@@ -88,11 +91,13 @@ type wrapped struct {
 
 func (w wrapped) Context() context.Context { return w.ctx }
 
-func actorOf(ctx context.Context) string {
-	if a, ok := ctx.Value(actorKey{}).(tokenauth.Actor); ok {
-		return a.Name()
+// actorOf returns the verified caller. The zero Actor is never authorised — the
+// use cases refuse it — so an unreachable path cannot become an open door.
+func actorOf(ctx context.Context) session.Actor {
+	if a, ok := ctx.Value(actorKey{}).(session.Actor); ok {
+		return a
 	}
-	return "" // unreachable behind the interceptor; empty is never authorised upstream
+	return session.Actor{}
 }
 
 func (s *Server) Start(ctx context.Context, req *agentdv1.StartRequest) (*agentdv1.StartResponse, error) {
@@ -117,7 +122,7 @@ func (s *Server) Send(ctx context.Context, req *agentdv1.SendRequest) (*agentdv1
 }
 
 func (s *Server) Snapshot(ctx context.Context, req *agentdv1.SnapshotRequest) (*agentdv1.SnapshotResponse, error) {
-	text, err := s.svc.Snapshot(ctx, req.GetSessionId(), int(req.GetLines()))
+	text, err := s.svc.Snapshot(ctx, actorOf(ctx), req.GetSessionId(), int(req.GetLines()))
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -131,8 +136,8 @@ func (s *Server) Signal(ctx context.Context, req *agentdv1.SignalRequest) (*agen
 	return &agentdv1.SignalResponse{}, nil
 }
 
-func (s *Server) List(context.Context, *agentdv1.ListRequest) (*agentdv1.ListResponse, error) {
-	all := s.svc.List()
+func (s *Server) List(ctx context.Context, _ *agentdv1.ListRequest) (*agentdv1.ListResponse, error) {
+	all := s.svc.List(ctx, actorOf(ctx))
 	out := make([]*agentdv1.Session, 0, len(all))
 	for _, x := range all {
 		out = append(out, toProto(x))
@@ -142,7 +147,7 @@ func (s *Server) List(context.Context, *agentdv1.ListRequest) (*agentdv1.ListRes
 
 func (s *Server) Stream(req *agentdv1.StreamRequest, srv grpc.ServerStreamingServer[agentdv1.OutputChunk]) error {
 	ctx := srv.Context()
-	ch, err := s.svc.Subscribe(ctx, req.GetSessionId(), req.GetFromSeq())
+	ch, err := s.svc.Subscribe(ctx, actorOf(ctx), req.GetSessionId(), req.GetFromSeq())
 	if err != nil {
 		return mapErr(err)
 	}
@@ -171,8 +176,17 @@ func mapErr(err error) error {
 		return status.Error(codes.NotFound, "no such session")
 	case errors.Is(err, session.ErrUnknownKind):
 		return status.Error(codes.InvalidArgument, "kind is not allowed")
-	case errors.Is(err, session.ErrWorkspaceEscapes), errors.Is(err, session.ErrWorkspaceEmpty):
+	case errors.Is(err, session.ErrWorkspaceEscapes), errors.Is(err, session.ErrWorkspaceEmpty),
+		errors.Is(err, session.ErrWorkspaceMissing):
 		return status.Error(codes.InvalidArgument, "workspace is not permitted")
+	case errors.Is(err, session.ErrEnvNotAllowed):
+		return status.Error(codes.InvalidArgument, "environment is not permitted")
+	case errors.Is(err, session.ErrUnknownSignal):
+		return status.Error(codes.InvalidArgument, "unknown signal")
+	case errors.Is(err, session.ErrTooManySessions):
+		return status.Error(codes.ResourceExhausted, "too many concurrent sessions")
+	case errors.Is(err, session.ErrNoActor):
+		return status.Error(codes.Unauthenticated, "unauthenticated")
 	default:
 		return status.Error(codes.Internal, "internal error")
 	}
@@ -180,11 +194,32 @@ func mapErr(err error) error {
 
 func toProto(s *session.Session) *agentdv1.Session {
 	return &agentdv1.Session{
-		Id: s.ID, Kind: s.Kind, Workspace: s.Workspace, TmuxName: s.TmuxName,
-		State:            agentdv1.State(s.State),
+		Id: s.ID, Owner: s.Owner, Kind: s.Kind, Workspace: s.Workspace,
+		TmuxName:         s.TmuxName,
+		State:            toProtoState(s.State),
 		CreatedAtUnix:    s.CreatedAt.Unix(),
 		LastActivityUnix: s.LastActivity.Unix(),
 		Cols:             int32(s.Cols), Rows: int32(s.Rows),
+	}
+}
+
+// toProtoState maps explicitly rather than casting the domain value. A cast
+// works only while the two enums happen to be numbered identically, so adding a
+// domain state would silently relabel every session on the wire.
+func toProtoState(st session.State) agentdv1.State {
+	switch st {
+	case session.StateStarting:
+		return agentdv1.State_STATE_STARTING
+	case session.StateIdle:
+		return agentdv1.State_STATE_IDLE
+	case session.StateWorking:
+		return agentdv1.State_STATE_WORKING
+	case session.StateWaitingInput:
+		return agentdv1.State_STATE_WAITING_INPUT
+	case session.StateExited:
+		return agentdv1.State_STATE_EXITED
+	default:
+		return agentdv1.State_STATE_UNSPECIFIED
 	}
 }
 

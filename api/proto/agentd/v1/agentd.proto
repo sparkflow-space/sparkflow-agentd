@@ -10,8 +10,14 @@ option go_package = "github.com/sparkflow-space/sparkflow-agentd/internal/genera
 // service) holds all of that and is the only thing that should.
 //
 // Every RPC requires a Zitadel JWT belonging to a PERSON, checked for
-// signature, expiry, issuer and audience. The daemon authenticates its caller;
-// it never authorises. See "CLI Agent Sessions" in the project vault.
+// signature, expiry, issuer and audience, over a mutually-authenticated TLS
+// connection. The daemon authenticates its caller; it never authorises about
+// PROJECTS — that is the calling service's job.
+//
+// It does enforce one thing of its own: a session belongs to the person who
+// started it, and another caller's token cannot see it in List or touch it with
+// Send, Stream, Snapshot or Signal. A foreign session id answers NOT_FOUND, the
+// same as one that never existed. See "CLI Agent Sessions" in the project vault.
 service AgentDaemon {
   // Start opens a session. `kind` selects a binary from the daemon's own
   // allow-list — a caller cannot pass a command line — and `workspace` must
@@ -52,6 +58,7 @@ enum Signal_ {
 
 message Session {
   string id = 1;
+  // owner is the IdP subject of the person the session belongs to.
   string kind = 2;
   string workspace = 3;
   string tmux_name = 4;
@@ -60,6 +67,7 @@ message Session {
   int64 last_activity_unix = 7;
   int32 cols = 8;
   int32 rows = 9;
+  string owner = 10;
 }
 
 message StartRequest {
@@ -96,7 +104,10 @@ message OutputChunk {
 
 message SnapshotRequest {
   string session_id = 1;
-  int32 lines = 2;  // 0 ⇒ the visible screen
+  // lines is how much SCROLLBACK to include above the visible screen; 0 ⇒ the
+  // visible screen alone. The text carries escape sequences, so it paints the
+  // same as the live stream.
+  int32 lines = 2;
 }
 message SnapshotResponse { string text = 1; }
 

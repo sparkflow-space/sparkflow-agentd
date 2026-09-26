@@ -30,6 +30,13 @@ test:
     - go test ./... -count=1
     - test -z "$(gofmt -l .)" || { echo "gofmt:"; gofmt -l .; exit 1; }
     - go vet ./...
+    # A published module's go.mod must describe itself honestly: two direct
+    # dependencies were marked `// indirect` until this gate existed.
+    - go mod tidy
+    - git diff --exit-code go.mod go.sum
+    # The control-mode adapter's subscriber fan-out is concurrent by nature, so
+    # the race detector is part of the gate rather than an occasional extra.
+    - go test -race ./... -count=1
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
@@ -45,7 +52,7 @@ test:tmux:
     - export GOPATH="$CI_PROJECT_DIR/.gopath"
   script:
     - tmux -V
-    - go test -tags tmux ./internal/infra/tmux/ -count=1
+    - go test -race -tags tmux ./internal/infra/tmux/ -count=1
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH

@@ -71,7 +71,7 @@ func TestState_ExitedIsTerminal(t *testing.T) {
 }
 
 func TestTmuxNaming_RoundTrips(t *testing.T) {
-	const id = "9f2c"
+	const id = "9f2c0011aabbccdd"
 	name := session.TmuxName(id)
 	if !session.IsOurs(name) {
 		t.Fatalf("%q must be recognised as ours", name)
@@ -82,6 +82,30 @@ func TestTmuxNaming_RoundTrips(t *testing.T) {
 	}
 	if _, ok := session.IDFromTmuxName("partner-claude"); ok {
 		t.Error("a session the daemon did not create must not be adopted — there are such sessions on the dev host right now")
+	}
+}
+
+// The id shape is a security boundary, not tidiness: a tmux -t target matches by
+// PREFIX (measured on 3.4), so an adopted short name like "sfagent-a" would make
+// every command aimed at the id "a" land on a real 16-hex session belonging to
+// somebody else. Fixed length removes the ambiguity: no valid name can be a
+// strict prefix of another.
+func TestIDFromTmuxName_RefusesAnythingButTheDaemonsOwnShape(t *testing.T) {
+	bad := []string{
+		"sfagent-a",                 // short: a prefix of a real session
+		"sfagent-0123456789abcdefX", // long: a squatter under our prefix
+		"sfagent-",                  // empty
+		"sfagent-0123456789ABCDEF",  // uppercase is not what we mint
+		"sfagent-0123456789abcdeg",  // not hex
+		"sfagent-01234567 9abcdef",  // a space
+	}
+	for _, name := range bad {
+		if id, ok := session.IDFromTmuxName(name); ok {
+			t.Errorf("IDFromTmuxName(%q) adopted it as %q", name, id)
+		}
+	}
+	if !session.ValidID("0123456789abcdef") {
+		t.Error("a 16-character lowercase hex id is exactly what randomIDs mints")
 	}
 }
 

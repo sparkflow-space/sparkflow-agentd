@@ -37,8 +37,14 @@ const (
 // service) holds all of that and is the only thing that should.
 //
 // Every RPC requires a Zitadel JWT belonging to a PERSON, checked for
-// signature, expiry, issuer and audience. The daemon authenticates its caller;
-// it never authorises. See "CLI Agent Sessions" in the project vault.
+// signature, expiry, issuer and audience, over a mutually-authenticated TLS
+// connection. The daemon authenticates its caller; it never authorises about
+// PROJECTS — that is the calling service's job.
+//
+// It does enforce one thing of its own: a session belongs to the person who
+// started it, and another caller's token cannot see it in List or touch it with
+// Send, Stream, Snapshot or Signal. A foreign session id answers NOT_FOUND, the
+// same as one that never existed. See "CLI Agent Sessions" in the project vault.
 type AgentDaemonClient interface {
 	// Start opens a session. `kind` selects a binary from the daemon's own
 	// allow-list — a caller cannot pass a command line — and `workspace` must
@@ -148,8 +154,14 @@ func (c *agentDaemonClient) List(ctx context.Context, in *ListRequest, opts ...g
 // service) holds all of that and is the only thing that should.
 //
 // Every RPC requires a Zitadel JWT belonging to a PERSON, checked for
-// signature, expiry, issuer and audience. The daemon authenticates its caller;
-// it never authorises. See "CLI Agent Sessions" in the project vault.
+// signature, expiry, issuer and audience, over a mutually-authenticated TLS
+// connection. The daemon authenticates its caller; it never authorises about
+// PROJECTS — that is the calling service's job.
+//
+// It does enforce one thing of its own: a session belongs to the person who
+// started it, and another caller's token cannot see it in List or touch it with
+// Send, Stream, Snapshot or Signal. A foreign session id answers NOT_FOUND, the
+// same as one that never existed. See "CLI Agent Sessions" in the project vault.
 type AgentDaemonServer interface {
 	// Start opens a session. `kind` selects a binary from the daemon's own
 	// allow-list — a caller cannot pass a command line — and `workspace` must

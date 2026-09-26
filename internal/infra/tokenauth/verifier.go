@@ -18,6 +18,8 @@ import (
 
 	"github.com/MicahParks/keyfunc/v3"
 	jwt "github.com/golang-jwt/jwt/v5"
+
+	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 )
 
 // ErrUnauthenticated is all a caller ever learns. The reason is logged by the
@@ -83,15 +85,13 @@ func New(ctx context.Context, jwksURL, issuer, audience string, onRefreshError f
 	return &Verifier{jwks: jwks, issuer: issuer, audience: audience}, nil
 }
 
-// Actor is the verified human behind a call: the token's subject, plus the
-// email when the token carries one. Only `Subject` is guaranteed.
-type Actor struct {
-	Subject string
-	Email   string
-}
-
 // Verify checks the token and returns who it belongs to.
-func (v *Verifier) Verify(raw string) (Actor, error) {
+//
+// The identity type is the DOMAIN's session.Actor rather than one of this
+// package's own: ownership of a session is a domain rule keyed on Actor.Subject,
+// so the handler's Verifier port can name it without importing infra — and a
+// second Actor type next to the first would eventually disagree with it.
+func (v *Verifier) Verify(raw string) (session.Actor, error) {
 	tok, err := jwt.Parse(raw, v.jwks.Keyfunc,
 		jwt.WithIssuer(v.issuer),
 		jwt.WithAudience(v.audience),
@@ -101,26 +101,16 @@ func (v *Verifier) Verify(raw string) (Actor, error) {
 		jwt.WithValidMethods([]string{"RS256", "RS384", "RS512"}),
 	)
 	if err != nil || !tok.Valid {
-		return Actor{}, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+		return session.Actor{}, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
 	}
 	claims, ok := tok.Claims.(jwt.MapClaims)
 	if !ok {
-		return Actor{}, ErrUnauthenticated
+		return session.Actor{}, ErrUnauthenticated
 	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
-		return Actor{}, fmt.Errorf("%w: no subject", ErrUnauthenticated)
+		return session.Actor{}, fmt.Errorf("%w: no subject", ErrUnauthenticated)
 	}
 	email, _ := claims["email"].(string)
-	return Actor{Subject: sub, Email: email}, nil
-}
-
-// Name is what goes in the audit log: the email when there is one, because a
-// human reading the log six months later knows an address and does not know a
-// Zitadel subject id.
-func (a Actor) Name() string {
-	if a.Email != "" {
-		return a.Email
-	}
-	return a.Subject
+	return session.Actor{Subject: sub, Email: email}, nil
 }

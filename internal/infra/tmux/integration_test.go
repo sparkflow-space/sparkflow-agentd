@@ -22,26 +22,63 @@ import (
 
 func TestAgainstRealTmux(t *testing.T) {
 	cli := tmux.NewCLI("")
-	ctrl := tmux.NewControl("", 1024)
+	ctrl := tmux.NewControl("", 1024, 1<<20, func(format string, v ...any) {
+		// Not t.Logf: a stream goroutine can log after the test function
+		// returns, and t.Logf then panics.
+		fmt.Printf("control: "+format+"\n", v...)
+	})
 	defer ctrl.Close()
 
-	name := session.TmuxName(fmt.Sprintf("test%d", time.Now().UnixNano()))
+	// A 16-hex id, the shape the daemon mints and reconciliation accepts.
+	sess := session.Session{
+		ID:        fmt.Sprintf("%016x", time.Now().UnixNano()),
+		Owner:     "sub-integration",
+		Kind:      "bash",
+		Workspace: "/tmp",
+		Cols:      200, Rows: 50,
+	}
+	sess.TmuxName = session.TmuxName(sess.ID)
+	name := sess.TmuxName
 	ctx := context.Background()
 
 	// Whatever happens below, do not leave a session on the host.
 	defer func() {
-		_ = cli.Kill(context.Background(), name)
-		if out, _ := exec.Command("tmux", "has-session", "-t", name).CombinedOutput(); len(out) == 0 {
+		_ = cli.Signal(context.Background(), sess, session.SignalKill)
+		if out, _ := exec.Command("tmux", "has-session", "-t", "="+name).CombinedOutput(); len(out) == 0 {
 			t.Errorf("leaked tmux session %s", name)
 		}
 	}()
 
-	if err := cli.Start(ctx, name, "/tmp", []string{"bash", "--norc"}, nil, 200, 50); err != nil {
+	pane, err := cli.Start(ctx, sess, []string{"bash", "--norc"}, nil)
+	if err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+	if !strings.HasPrefix(pane, "%") {
+		t.Fatalf("Start returned pane %q", pane)
+	}
+	sess.PaneID = pane
+
+	// The labels must be readable back OFF TMUX: that is the mechanism ownership
+	// survives a daemon restart by, so it is proved here rather than assumed.
+	live, err := cli.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var found *session.Live
+	for i := range live {
+		if live[i].TmuxName == name {
+			found = &live[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("List did not return %s: %+v", name, live)
+	}
+	if found.Owner != "sub-integration" || found.Kind != "bash" || found.Workspace != "/tmp" || found.PaneID != pane {
+		t.Errorf("labels came back as %+v", *found)
 	}
 
 	// The size must be what we asked for, not tmux's 80x24 default.
-	size, err := exec.Command("tmux", "display-message", "-p", "-t", name, "#{pane_width}x#{pane_height}").Output()
+	size, err := exec.Command("tmux", "display-message", "-p", "-t", pane, "#{pane_width}x#{pane_height}").Output()
 	if err != nil {
 		t.Fatalf("display-message: %v", err)
 	}
@@ -57,7 +94,7 @@ func TestAgainstRealTmux(t *testing.T) {
 	}
 
 	const marker = "agentd-marker-42"
-	if err := cli.SendKeys(ctx, name, "echo "+marker, true); err != nil {
+	if err := cli.SendKeys(ctx, pane, "echo "+marker, true); err != nil {
 		t.Fatalf("SendKeys: %v", err)
 	}
 
@@ -92,19 +129,50 @@ found:
 		t.Error("output still carries octal escapes — DecodeOutput is not on the path")
 	}
 
-	if err := captureShowsMarker(cli, name, marker); err != nil {
+	if err := captureShowsMarker(cli, pane, marker); err != nil {
 		t.Error(err)
 	}
 
-	if err := cli.Signal(ctx, name, session.SignalKill); err != nil {
+	// A window the agent opens for itself must NOT reach the client's stream:
+	// the transcript is one terminal, and capture-pane and send-keys both address
+	// the pane we started, so merging another one corrupts what the panel paints.
+	if out, err := exec.Command("tmux", "new-window", "-t", "="+name, "-d",
+		"echo SECONDWINDOW; sleep 5").CombinedOutput(); err != nil {
+		t.Fatalf("new-window: %v: %s", err, out)
+	}
+	const marker2 = "agentd-marker-43"
+	if err := cli.SendKeys(ctx, pane, "echo "+marker2, true); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	deadline2 := time.After(8 * time.Second)
+	for !hasExactLine(seen.String(), marker2) {
+		select {
+		case ck, ok := <-ch:
+			if !ok {
+				t.Fatalf("stream closed before the second marker; saw %q", seen.String())
+			}
+			seen.Write(ck.Data)
+		case <-deadline2:
+			t.Fatalf("no second marker within the deadline; saw %q", seen.String())
+		}
+	}
+	if strings.Contains(seen.String(), "SECONDWINDOW") {
+		t.Error("output from another pane of the session leaked into the stream")
+	}
+
+	if err := cli.Signal(ctx, sess, session.SignalKill); err != nil {
 		t.Fatalf("Signal KILL: %v", err)
 	}
-	names, err := cli.List(ctx)
+	// KILL is idempotent: the caller's intent is satisfied either way.
+	if err := cli.Signal(ctx, sess, session.SignalKill); err != nil {
+		t.Errorf("a second KILL must succeed, got %v", err)
+	}
+	after, err := cli.List(ctx)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	for _, n := range names {
-		if n == name {
+	for _, l := range after {
+		if l.TmuxName == name {
 			t.Fatal("KILL must leave no session behind")
 		}
 	}
@@ -142,8 +210,8 @@ func stripANSI(s string) string {
 
 // captureShowsMarker checks the snapshot path — the one a reconnecting client
 // paints before the stream resumes.
-func captureShowsMarker(cli *tmux.CLI, name, marker string) error {
-	text, err := cli.Capture(context.Background(), name, 0)
+func captureShowsMarker(cli *tmux.CLI, pane, marker string) error {
+	text, err := cli.Capture(context.Background(), pane, 0)
 	if err != nil {
 		return fmt.Errorf("Capture: %w", err)
 	}

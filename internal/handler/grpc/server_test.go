@@ -10,17 +10,17 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 	handler "github.com/sparkflow-space/sparkflow-agentd/internal/handler/grpc"
-	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/tokenauth"
 )
 
 type stubVerifier struct {
-	actor tokenauth.Actor
+	actor session.Actor
 	err   error
 	saw   string
 }
 
-func (s *stubVerifier) Verify(raw string) (tokenauth.Actor, error) {
+func (s *stubVerifier) Verify(raw string) (session.Actor, error) {
 	s.saw = raw
 	return s.actor, s.err
 }
@@ -80,7 +80,7 @@ func TestInterceptor_RefusesABadTokenWithoutSayingWhy(t *testing.T) {
 }
 
 func TestInterceptor_AcceptsBearerCaseInsensitivelyAndPassesTheRawToken(t *testing.T) {
-	v := &stubVerifier{actor: tokenauth.Actor{Subject: "u1", Email: "boris@example.test"}}
+	v := &stubVerifier{actor: session.Actor{Subject: "u1", Email: "boris@example.test"}}
 	u, _ := unaryWith(t, v)
 
 	for _, header := range []string{"Bearer tok-123", "bearer tok-123", "BEARER tok-123"} {

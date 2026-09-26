@@ -132,16 +132,18 @@ func (Signal_) EnumDescriptor() ([]byte, []int) {
 }
 
 type Session struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Id               string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Kind             string                 `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
-	Workspace        string                 `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
-	TmuxName         string                 `protobuf:"bytes,4,opt,name=tmux_name,json=tmuxName,proto3" json:"tmux_name,omitempty"`
-	State            State                  `protobuf:"varint,5,opt,name=state,proto3,enum=agentd.v1.State" json:"state,omitempty"`
-	CreatedAtUnix    int64                  `protobuf:"varint,6,opt,name=created_at_unix,json=createdAtUnix,proto3" json:"created_at_unix,omitempty"`
-	LastActivityUnix int64                  `protobuf:"varint,7,opt,name=last_activity_unix,json=lastActivityUnix,proto3" json:"last_activity_unix,omitempty"`
-	Cols             int32                  `protobuf:"varint,8,opt,name=cols,proto3" json:"cols,omitempty"`
-	Rows             int32                  `protobuf:"varint,9,opt,name=rows,proto3" json:"rows,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// owner is the IdP subject of the person the session belongs to.
+	Kind             string `protobuf:"bytes,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	Workspace        string `protobuf:"bytes,3,opt,name=workspace,proto3" json:"workspace,omitempty"`
+	TmuxName         string `protobuf:"bytes,4,opt,name=tmux_name,json=tmuxName,proto3" json:"tmux_name,omitempty"`
+	State            State  `protobuf:"varint,5,opt,name=state,proto3,enum=agentd.v1.State" json:"state,omitempty"`
+	CreatedAtUnix    int64  `protobuf:"varint,6,opt,name=created_at_unix,json=createdAtUnix,proto3" json:"created_at_unix,omitempty"`
+	LastActivityUnix int64  `protobuf:"varint,7,opt,name=last_activity_unix,json=lastActivityUnix,proto3" json:"last_activity_unix,omitempty"`
+	Cols             int32  `protobuf:"varint,8,opt,name=cols,proto3" json:"cols,omitempty"`
+	Rows             int32  `protobuf:"varint,9,opt,name=rows,proto3" json:"rows,omitempty"`
+	Owner            string `protobuf:"bytes,10,opt,name=owner,proto3" json:"owner,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -237,6 +239,13 @@ func (x *Session) GetRows() int32 {
 		return x.Rows
 	}
 	return 0
+}
+
+func (x *Session) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
 }
 
 type StartRequest struct {
@@ -573,9 +582,12 @@ func (x *OutputChunk) GetAtUnixNano() int64 {
 }
 
 type SnapshotRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	Lines         int32                  `protobuf:"varint,2,opt,name=lines,proto3" json:"lines,omitempty"` // 0 ⇒ the visible screen
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// lines is how much SCROLLBACK to include above the visible screen; 0 ⇒ the
+	// visible screen alone. The text carries escape sequences, so it paints the
+	// same as the live stream.
+	Lines         int32 `protobuf:"varint,2,opt,name=lines,proto3" json:"lines,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -840,7 +852,7 @@ var File_agentd_v1_agentd_proto protoreflect.FileDescriptor
 
 const file_agentd_v1_agentd_proto_rawDesc = "" +
 	"\n" +
-	"\x16agentd/v1/agentd.proto\x12\tagentd.v1\"\x8e\x02\n" +
+	"\x16agentd/v1/agentd.proto\x12\tagentd.v1\"\xa4\x02\n" +
 	"\aSession\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x1c\n" +
@@ -850,7 +862,9 @@ const file_agentd_v1_agentd_proto_rawDesc = "" +
 	"\x0fcreated_at_unix\x18\x06 \x01(\x03R\rcreatedAtUnix\x12,\n" +
 	"\x12last_activity_unix\x18\a \x01(\x03R\x10lastActivityUnix\x12\x12\n" +
 	"\x04cols\x18\b \x01(\x05R\x04cols\x12\x12\n" +
-	"\x04rows\x18\t \x01(\x05R\x04rows\"z\n" +
+	"\x04rows\x18\t \x01(\x05R\x04rows\x12\x14\n" +
+	"\x05owner\x18\n" +
+	" \x01(\tR\x05owner\"z\n" +
 	"\fStartRequest\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x1c\n" +
 	"\tworkspace\x18\x02 \x01(\tR\tworkspace\x12\x10\n" +
