@@ -5,6 +5,7 @@ A daemon that owns **CLI-agent sessions on a host** — `claude`, `opencode-go`,
 over gRPC.
 
 ```sh
+# after the first release — until then use @develop, see Status below
 go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@latest
 ```
 
@@ -65,6 +66,21 @@ This process runs other people's code on your host. Everything below follows fro
 Nothing secret belongs in this file's defaults or in source: the module is published, and a
 published `path@version` is cached by `proxy.golang.org` forever.
 
+## Development
+
+This repository lives here, on GitHub. Changes go through a pull request into
+`develop`; `main` moves only by a numbered release. CI is `.github/workflows/test.yml`:
+build, test, gofmt, vet, `go mod tidy` drift, the race detector, and an integration job
+against a real tmux.
+
 ## Status
 
-Early. Contract and design: `AGENTD-001` / "CLI Agent Sessions" in the project vault.
+Early — no release tag yet, so `@latest` resolves to the skeleton on `main` and **fails**
+("module does not contain package"). Until the first release, install the current
+development line with:
+
+```sh
+go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@develop
+```
+
+Contract and design: `AGENTD-001` / "CLI Agent Sessions" in the project vault.

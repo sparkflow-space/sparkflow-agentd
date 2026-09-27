@@ -7,12 +7,16 @@ exactly one caller, the in-cluster `agent-sessions` service.
 **This repository is different from every other one in the estate in two ways. Both matter
 before you touch anything.**
 
-1. **It is published to GitHub.** Development lives here on GitLab, but the module path is
-   `github.com/sparkflow-space/sparkflow-agentd` and a tag is mirrored out so
-   `go install …@latest` works — the same track as `sparkflow-sync`, procedure in the
-   `cli-release` skill. Two consequences: **nothing secret may live in source or defaults**,
-   and **a published `path@version` is cached by `proxy.golang.org` forever** — a bad
-   release is fixed by the next PATCH, never by moving a tag.
+1. **It lives on GitHub** — `github.com/sparkflow-space/sparkflow-agentd`, public, so
+   `go install …@latest` works. This is the repository's HOME, not a mirror: branches,
+   pull requests and CI (GitHub Actions, `.github/workflows/test.yml`) are all here. It is
+   the one repository in the estate that is not on GitLab, by the owner's decision.
+   _(It started on GitLab with GitHub planned as a release mirror, like `sparkflow-sync`.
+   That was a deviation from the owner's instruction, reverted on 2026-09-27.)_
+   Two consequences: **nothing secret may live in source, defaults or history** — the
+   repository is public — and **a published `path@version` is cached by
+   `proxy.golang.org` forever**: a bad release is fixed by the next PATCH, never by
+   moving a tag.
 2. **It runs other people's code.** Everything below follows from that.
 
 ## The rules that are not negotiable
@@ -52,7 +56,7 @@ before you touch anything.**
 
 `Handler → Application → Domain ← Infra`, enforced by `internal/archtest`. The
 `applicationThirdParty` allow-list is **empty on purpose** — the use cases reach tmux and
-the verifier only through ports. Adding an entry is a design decision; say why in the MR.
+the verifier only through ports. Adding an entry is a design decision; say why in the PR.
 
 **This repo's copy of `layering_test.go` also judges the HANDLER layer**, which the shared
 version does not: `Handler → Application → Domain` says nothing about handler → infra, so a
@@ -93,6 +97,10 @@ Measured on tmux 3.4, not recalled:
 - The raw server socket protocol is unversioned — never use it.
 
 ## Testing
+
+Every change goes through a **pull request into `develop`**; `main` and `develop` are
+protected: PR required, no force-push, and the CI jobs `test` and `tmux` are **required
+checks** — a red PR cannot be merged. CI runs the same gates as below.
 
 ```sh
 make gates                       # build + test + gofmt + vet
