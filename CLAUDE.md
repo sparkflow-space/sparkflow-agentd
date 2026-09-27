@@ -56,7 +56,7 @@ before you touch anything.**
 
 `Handler → Application → Domain ← Infra`, enforced by `internal/archtest`. The
 `applicationThirdParty` allow-list is **empty on purpose** — the use cases reach tmux and
-the verifier only through ports. Adding an entry is a design decision; say why in the MR.
+the verifier only through ports. Adding an entry is a design decision; say why in the PR.
 
 **This repo's copy of `layering_test.go` also judges the HANDLER layer**, which the shared
 version does not: `Handler → Application → Domain` says nothing about handler → infra, so a
@@ -99,7 +99,8 @@ Measured on tmux 3.4, not recalled:
 ## Testing
 
 Every change goes through a **pull request into `develop`**; `main` and `develop` are
-protected (PR required, no force-push). CI runs the same gates as below.
+protected: PR required, no force-push, and the CI jobs `test` and `tmux` are **required
+checks** — a red PR cannot be merged. CI runs the same gates as below.
 
 ```sh
 make gates                       # build + test + gofmt + vet

@@ -3,10 +3,16 @@
 # Ported from the .gitlab-ci.yml this project started with. Two lessons from
 # that file are kept deliberately:
 #
-# * The Go version comes FROM go.mod (`go-version-file`), not from a pinned
-#   image tag. On GitLab the image was golang:1.24 against a go.mod asking for
+# * The Go MINOR follows go.mod (`go 1.25.0` → 1.25.x), and the PATCH is the
+#   latest one. On GitLab the image was golang:1.24 against a go.mod asking for
 #   1.25.0; with GOTOOLCHAIN=local that failed the first command of every
 #   pipeline the repository ever ran, while local gates were green.
+#   `go-version-file: go.mod` was tried first and is subtly worse: with no
+#   `toolchain` line it installs EXACTLY 1.25.0 — the build, vet and race gates
+#   then run on a compiler without the 1.25 security and runtime fixes. Bump
+#   the minor here in the same commit that bumps go.mod.
+# * Actions are pinned by commit SHA (the tag is in the comment): this
+#   repository is public, and a moved tag would otherwise change what runs.
 # * gofmt lists TRACKED files, never `.`, so a module cache inside the workspace
 #   cannot put a dependency's formatting into our gate.
 name: test
@@ -22,11 +28,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A hung job would otherwise sit for the Actions default of six hours.
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          go-version: '1.25.x'
+          check-latest: true
       - name: build
         run: go build ./...
       - name: test
@@ -50,11 +59,15 @@ jobs:
     # needs a real tmux, so it is tagged in rather than skipped — "0 tests ran"
     # must never be mistaken for "the adapter works".
     runs-on: ubuntu-latest
+    # A control-mode attach that never exits is exactly the failure this job
+    # exists to catch; it must fail fast, not hold a runner for six hours.
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version-file: go.mod
+          go-version: '1.25.x'
+          check-latest: true
       - name: install tmux
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
       - run: tmux -V

@@ -5,6 +5,7 @@ A daemon that owns **CLI-agent sessions on a host** — `claude`, `opencode-go`,
 over gRPC.
 
 ```sh
+# after the first release — until then use @develop, see Status below
 go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@latest
 ```
 
@@ -74,8 +75,9 @@ against a real tmux.
 
 ## Status
 
-Early — no release tag yet, so `@latest` resolves to the skeleton on `main`. Until the
-first release, install the current development line with:
+Early — no release tag yet, so `@latest` resolves to the skeleton on `main` and **fails**
+("module does not contain package"). Until the first release, install the current
+development line with:
 
 ```sh
 go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@develop
