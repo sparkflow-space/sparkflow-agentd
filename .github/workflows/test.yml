@@ -78,3 +78,41 @@ jobs:
           if tmux ls 2>/dev/null | grep -q '^sfagent-'; then
             echo "leaked tmux sessions:"; tmux ls; exit 1
           fi
+
+  release-dry-run:
+    # The release path, rehearsed on every pull request — so a defect in it
+    # costs a CI run instead of a version number. This is sparkflow-sync's
+    # hardest lesson: its v0.7.0 died installing GoReleaser and its v0.7.1 died
+    # on a dirty tree, and because a pushed tag is public and immutable, BOTH
+    # numbers are burned forever with no Release page. A release workflow that
+    # first runs on the real tag is exactly how that happens.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
+        env:
+          # The version the stamp must carry through. Asserted below: the
+          # property is the string the binary prints, not that GoReleaser
+          # exited 0 — Go ignores an unknown -X target without a word.
+          GORELEASER_CURRENT_TAG: v0.0.0-dryrun
+      - name: the archives exist and the binary reports the tag exactly
+        run: |
+          set -eu
+          ls dist/*.tar.gz dist/checksums.txt
+          n=$(ls dist/*.tar.gz | wc -l)
+          [ "$n" -eq 4 ] || { echo "expected 4 archives, got $n"; exit 1; }
+          bin=$(find dist -path '*linux_amd64*' -name sparkflow-agentd -type f | head -1)
+          got=$("$bin" -version)
+          echo "binary reports: $got"
+          [ "$got" = "v0.0.0-dryrun" ] || { echo "version stamp is wrong"; exit 1; }
