@@ -11,3 +11,4 @@ dist/
 # `sparkflow-agentd` would also ignore the source dir of the same name
 # (cmd/sparkflow-agentd). See docs CLAUDE.md, TENANCY-030, WIKI-230.
 /sparkflow-agentd
+/dist/
