@@ -1,0 +1,82 @@
+# GoReleaser — the daemon's release mechanism (AGENTD-002).
+#
+# Runs on GitHub Actions when a vX.Y.Z tag is pushed (.github/workflows/
+# release.yml). Unlike sparkflow-sync there is no GitLab half and no mirror:
+# this repository lives on GitHub. Modelled on sparkflow-sync's proven config.
+version: 2
+
+project_name: sparkflow-agentd
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: sparkflow-agentd
+    main: ./cmd/sparkflow-agentd
+    binary: sparkflow-agentd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # .Tag, not .Version: GoReleaser strips the leading "v" from .Version,
+    # while `go install …@vX.Y.Z` reports the tag verbatim through the build
+    # info. `-version` must not disagree with itself depending on how the
+    # binary was obtained.
+    ldflags:
+      - -s -w -X main.version={{.Tag}}
+    # NO windows: the daemon drives tmux and signals the pane's process with
+    # POSIX signals; there is no tmux to drive on Windows.
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    ids:
+      - sparkflow-agentd
+    # sparkflow-agentd_v0.1.0_linux_amd64.tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge branch
+      - Merge pull request
+
+release:
+  github:
+    owner: sparkflow-space
+    name: sparkflow-agentd
+  # A release is cut deliberately and its notes are written in the project
+  # vault; the generated changelog is the appendix, not the announcement.
+  draft: false
+  prerelease: auto
+  footer: |
+    ---
+    Install with Go:
+
+    ```sh
+    go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@{{ .Tag }}
+    ```
+
+    The daemon needs `tmux` on the host and refuses to start without mutual TLS
+    unless it is bound to loopback — see the README.

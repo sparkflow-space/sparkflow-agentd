@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,9 +36,35 @@ import (
 	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/tokenauth"
 )
 
+// version is stamped at release time by GoReleaser (-X main.version={{.Tag}}).
+//
+// Without the stamp the module version recorded in the build info is used:
+// `go install …@vX.Y.Z` records the tag, and a local `go build` in a checkout
+// records a pseudo-version derived from the commit (measured: a build at
+// 6ed5e46 reports v0.0.0-20260927105140-6ed5e469b2fd). So the binary reports
+// the same version however it was obtained, and "dev" only when there is no
+// build info at all.
+var version = "dev"
+
+func versionString() string {
+	if version != "dev" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return version
+}
+
 func main() {
 	cfgPath := flag.String("config", "", "path to config.json")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	if err := run(*cfgPath); err != nil {
 		log.Fatalf("sparkflow-agentd: %v", err)
