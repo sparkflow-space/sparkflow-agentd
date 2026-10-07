@@ -226,6 +226,14 @@ func gone(err error) bool {
 		strings.Contains(msg, "can't find pane") ||
 		strings.Contains(msg, "no such session") ||
 		strings.Contains(msg, "no server running") ||
+		// The server is up but holds NO sessions at all — kept alive by the
+		// daemon's own control-mode attach after the agent's pane died.
+		// tmux 3.4 then cannot even resolve a "current" session for
+		// `kill-session -t =name` and says this instead of "can't find
+		// session". Measured on dev 2026-10-07: Stop's KILL failed with it
+		// for a session that was already gone, and the server kept the row
+		// "running" until the next reconcile.
+		strings.Contains(msg, "no current target") ||
 		strings.Contains(msg, os.ErrProcessDone.Error())
 }
 
