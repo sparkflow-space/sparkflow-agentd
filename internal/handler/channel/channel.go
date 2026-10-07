@@ -17,6 +17,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sparkflow-space/sparkflow-agentd/internal/application/sessions"
@@ -50,6 +51,8 @@ type Runner struct {
 	Kinds   []string
 	// Backoff bounds; zero means 1s..60s.
 	MinBackoff, MaxBackoff time.Duration
+	// HandshakeTimeout bounds the wait for Welcome; zero means 30s.
+	HandshakeTimeout time.Duration
 	// Classify says whether a connect/stream error is permanent (revoked,
 	// signed out). nil means "never".
 	Classify func(error) bool
@@ -141,9 +144,32 @@ func (r *Runner) once(ctx context.Context) error {
 	if err := st.Send(&agentv1.HostMessage{Msg: &agentv1.HostMessage_Hello{Hello: hello}}); err != nil {
 		return fmt.Errorf("hello: %w", err)
 	}
-	first, err := st.Recv()
-	if err != nil {
-		return fmt.Errorf("handshake: %w", err)
+	// Welcome within a deadline. Measured on dev 2026-10-07: after the server
+	// pod restarted, ingress-nginx kept retrying the OLD pod IP for this very
+	// request and never answered — and without a deadline the daemon waited
+	// for Welcome forever, silently, with the host shown offline.
+	hs := r.HandshakeTimeout
+	if hs <= 0 {
+		hs = 30 * time.Second
+	}
+	type recv struct {
+		m   *agentv1.ServerMessage
+		err error
+	}
+	firstc := make(chan recv, 1)
+	go func() { m, err := st.Recv(); firstc <- recv{m, err} }()
+	var first *agentv1.ServerMessage
+	select {
+	case got := <-firstc:
+		if got.err != nil {
+			return fmt.Errorf("handshake: %w", got.err)
+		}
+		first = got.m
+	case <-time.After(hs):
+		cancel() // ends the stream, and with it the Recv above
+		return fmt.Errorf("handshake: no Welcome within %s", hs)
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	w := first.GetWelcome()
 	if w == nil {
@@ -167,11 +193,21 @@ func (r *Runner) once(ctx context.Context) error {
 	if every <= 0 {
 		every = 20 * time.Second
 	}
+	// The watchdog: the server heartbeats every `every`; three missed means
+	// the stream is dead even when TCP and gRPC keepalives say otherwise (a
+	// proxy can keep both ends' connections alive while the stream between
+	// them carries nothing).
+	var lastRecv atomic.Int64
+	lastRecv.Store(time.Now().UnixNano())
 	sendErr := make(chan error, 1)
 	go func() {
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
+			if since := time.Since(time.Unix(0, lastRecv.Load())); since > 3*every {
+				sendErr <- fmt.Errorf("the server has been silent for %s", since.Round(time.Second))
+				return
+			}
 			select {
 			case m := <-out:
 				if err := st.Send(m); err != nil {
@@ -200,6 +236,7 @@ func (r *Runner) once(ctx context.Context) error {
 				recvErr <- err
 				return
 			}
+			lastRecv.Store(time.Now().UnixNano())
 			op := m.GetOperation()
 			if op == nil {
 				continue
