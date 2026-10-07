@@ -18,7 +18,11 @@ import (
 var ErrNone = errors.New("this device is not enrolled — run `sparkflow-agentd init`")
 
 // Store is one credentials file.
-type Store struct{ Path string }
+type Store struct {
+	Path string
+	// rename is os.Rename; a test swaps it to fail the last step.
+	rename func(oldpath, newpath string) error
+}
 
 // DefaultDir is $XDG_CONFIG_HOME/sparkflow-agentd, else ~/.config/sparkflow-agentd.
 func DefaultDir() (string, error) {
@@ -97,7 +101,11 @@ func (s Store) Save(c host.Credentials) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, s.Path)
+	rename := s.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	return rename(tmpName, s.Path)
 }
 
 // Remove deletes the file (uninstall).

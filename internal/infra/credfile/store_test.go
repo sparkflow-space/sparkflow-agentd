@@ -55,24 +55,3 @@ func TestLoad_RefusesAFileOthersCanRead(t *testing.T) {
 		t.Fatal("the error must not carry the content")
 	}
 }
-
-func TestSave_AFailedWriteKeepsTheOldFile(t *testing.T) {
-	dir := t.TempDir()
-	s := credfile.Store{Path: filepath.Join(dir, "credentials.json")}
-	_ = s.Save(host.Credentials{RefreshToken: "old"})
-	// Make the directory unwritable so the temp file cannot be created: the
-	// old credentials must survive untouched.
-	_ = os.Chmod(dir, 0o500)
-	defer os.Chmod(dir, 0o700)
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
-	if err := s.Save(host.Credentials{RefreshToken: "new"}); err == nil {
-		t.Fatal("want a write error")
-	}
-	_ = os.Chmod(dir, 0o700)
-	got, _ := s.Load()
-	if got.RefreshToken != "old" {
-		t.Fatalf("the old file was damaged: %+v", got)
-	}
-}
