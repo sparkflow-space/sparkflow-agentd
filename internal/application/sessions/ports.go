@@ -45,15 +45,30 @@ type Tmux interface {
 	Release(name string)
 }
 
-// Workspaces answers whether a path is a directory on this host.
+// Workspaces is the host's filesystem as the use cases need it.
 //
-// It exists because the lexical root check is not enough: tmux SILENTLY falls
-// back to its own working directory when `-c` names a path that does not exist
-// (measured on 3.4 — `new-session -c /srv/agents/nope` exited 0 and the pane
-// printed CWD=/root), so a typo would run the agent in the daemon's own home
-// while the session record and the audit line both claimed the workspace.
+// IsDir exists because a lexical check is not enough: tmux SILENTLY falls
+// back to its own working directory when `-c` names a path that does not
+// exist (measured on 3.4 — `new-session -c /srv/agents/nope` exited 0 and the
+// pane printed CWD=/root), so a typo would run the agent in the daemon's own
+// home while the session record and the audit line both claimed the folder.
 type Workspaces interface {
 	IsDir(path string) bool
+	// Resolve returns the absolute path with every symlink resolved, so the
+	// containment check sees where a path really goes.
+	Resolve(path string) (string, error)
+	IsGitRoot(path string) bool
+	ListDirs(path string) ([]session.Dir, error)
+	// AddWorktree creates a fresh worktree of repo at path on a new branch.
+	AddWorktree(ctx context.Context, repo, path, branch string) error
+	// RemoveWorktree undoes AddWorktree (a Start that failed after it).
+	RemoveWorktree(ctx context.Context, repo, path, branch string) error
+}
+
+// Events tells the server about a session's state changes (the host channel
+// carries them up). Optional: nil drops them.
+type Events interface {
+	SessionState(id string, st session.State)
 }
 
 // Audit records who did what, and — equally — who was refused.

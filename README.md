@@ -1,86 +1,98 @@
 # sparkflow-agentd
 
-A daemon that owns **CLI-agent sessions on a host** — `claude`, `opencode-go`, `qwen`,
-`kimi`, `z.ai` and friends — each running in its own `tmux` session, and exposes them
-over gRPC.
+Runs CLI coding agents — `claude`, `opencode`, `qwen`, `kimi` and friends — **on your own
+machine**, each in its own `tmux` session, driven from Sparkflow: press Play on a board card,
+type into the session from the web or the tablet, let the chat agent instruct it.
+
+The daemon **dials out**. It opens no port: it holds one outbound connection to Sparkflow, over
+which the work for your sessions arrives. One device is one *host*; you can enrol as many
+devices as you like (a laptop, a workstation, a server), and Sparkflow lets you pick which one
+runs an agent.
+
+## Install and enrol
 
 ```sh
-# after the first release — until then use @develop, see Status below
 go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@latest
+sparkflow-agentd init                 # production; add --debug-dev for the development deployment
 ```
 
-It is deliberately **dumb**: it knows sessions, PTYs, bytes and an audit line per command.
-It knows nothing about companies, projects or permissions — those belong to the service
-that calls it, which is the only thing that should.
+`init`:
+
+1. **signs you in** — it prints a link (and opens it when this machine has a browser). After
+   you sign in, the browser comes back to `localhost` and the terminal carries on by itself.
+   **Over SSH**, with the browser on another machine, that redirect reaches nothing: copy the
+   address from the browser's address bar — or just the code in it — paste it into the terminal
+   and press Enter;
+2. **suggests a name** — `<OS> · <Country>`, e.g. `Ubuntu · Germany` (the country comes from
+   your time zone, offline); Enter accepts it;
+3. **finds the agents** whose programs are on your `PATH` — the host offers only those;
+4. **registers this device** as one of your hosts and stores the sign-in in
+   `~/.config/sparkflow-agentd/credentials.json` (directory `0700`, file `0600`);
+5. **offers to run it with the system** — a systemd *user* unit on Linux (plus
+   `loginctl enable-linger`, so it keeps running after you log out), a LaunchAgent on macOS.
+   Decline, or pass `--no-service`, and it prints the commands instead.
+
+Running `init` again on the same device keeps the same host (one host per device). `--new`
+replaces the enrolment; `--name`, `--yes`, `--no-browser`, `--manual` and
+`--server`/`--issuer`/`--client-id` do what they say (`sparkflow-agentd init -h`).
+
+Then, in Sparkflow, choose a **working folder** for each project on this host (project settings
+→ Agents): the folder picker browses your home directory. A git repository gets a fresh
+worktree per session under `<repo>/.claude/worktrees/`; a plain folder is used as it is.
+
+```sh
+sparkflow-agentd status                  # who this device is enrolled to, and whether it runs
+sparkflow-agentd service install|uninstall|status
+sparkflow-agentd run                     # what the service runs; in the foreground for debugging
+```
+
+**A lost or retired device**: revoke it in Sparkflow → My hosts. Its connection is closed and
+refused from then on; delete `~/.config/sparkflow-agentd/` on the device if you still have it.
 
 ## Security
 
-This process runs other people's code on your host. Everything below follows from that.
+This daemon runs code as you. What it refuses, and why:
 
-- **Mutual TLS on the wire.** The daemon serves TLS 1.3 and requires a client certificate
-  signed by a CA you name. It starts in plaintext only when `tls.allow_plaintext_loopback`
-  is set *and* the listen address is loopback — because the caller's bearer token crosses
-  this hop and grants code execution for its whole lifetime.
-- **A person's Zitadel JWT on every RPC** — signature, expiry, issuer and audience. The
-  daemon authenticates its caller; it never authorises about projects.
-- **A session belongs to the person who started it.** Another caller's token cannot see it
-  in `List` or touch it with `Send`, `Stream`, `Snapshot` or `Signal`; a foreign id answers
-  `NOT_FOUND`, the same as one that never existed. Ownership is written onto the tmux
-  session itself, so it survives a daemon restart the way liveness does.
-- **`kind` picks a binary from the daemon's own allow-list**; a caller cannot pass a
-  command line. `workspace` must sit under a configured root **and exist** — tmux silently
-  falls back to its own working directory for a `-c` path that does not.
-- **The environment is an allow-list too**, defaulting to `SPARKFLOW_`. Without one,
-  `LD_PRELOAD`, `BASH_ENV`, `NODE_OPTIONS` or `GIT_SSH_COMMAND` would run the caller's code
-  inside an allow-listed binary and make the `kind` rule a formality.
-- **Concurrency is capped**, per person and per host.
-- **Every attempt is audited** — refusals and errors as well as successes, with env names
-  and never env values.
-- It refuses to bind a wildcard address, and the address is parsed rather than
-  string-matched: `[::0]` is a wildcard too.
+- **It serves one person** — whoever ran `init`. Every operation names the person it is for,
+  and anything naming someone else is refused here and logged, even though Sparkflow already
+  routes only your work to your hosts.
+- **A caller passes a kind, never a command line.** Kinds resolve against the daemon's own
+  allow-list. **The environment is an allow-list too** (`SPARKFLOW_` by default): `LD_PRELOAD`,
+  `BASH_ENV`, `NODE_OPTIONS` and friends would otherwise run arbitrary code inside an allowed
+  binary.
+- **A working folder must lie under your home, after symlinks are resolved, and exist.**
+- **No listening port**; the bearer token travels only over TLS (plain HTTP is accepted for
+  loopback alone, for a local development stack).
+- **The credentials file is the crown jewel**: whoever reads it can run your agents on this
+  device. It is created `0600` and refused if it becomes readable by others. Tokens and codes
+  are never printed or logged.
+- **Every attempt is audited** — refusals and errors as well as successes — to stdout (the
+  journal, under the service).
+- **Stop kills and leaves the folder alone**: uncommitted work stays on disk.
 
 ## Configuration
 
+Optional: `~/.config/sparkflow-agentd/config.json` overrides the defaults.
+
 ```json
 {
-  "listen": "10.0.0.7:50077",
-  "tls": {
-    "cert_file": "/etc/sparkflow-agentd/server.crt",
-    "key_file": "/etc/sparkflow-agentd/server.key",
-    "client_ca_file": "/etc/sparkflow-agentd/clients-ca.crt"
-  },
-  "workspace_root": "/srv/agents",
-  "kinds": { "claude": ["claude"], "qwen": ["qwen", "--tui"] },
+  "kinds": { "claude": ["claude"], "qwen": ["qwen"] },
   "env_allow_prefixes": ["SPARKFLOW_"],
   "max_sessions_per_owner": 8,
-  "max_sessions": 32,
-  "reconcile_seconds": 30,
-  "auth": {
-    "jwks_url": "https://id.example/oauth/v2/keys",
-    "issuer": "https://id.example",
-    "audience": "<project id>"
-  }
+  "max_sessions": 32
 }
 ```
 
-Nothing secret belongs in this file's defaults or in source: the module is published, and a
-published `path@version` is cached by `proxy.golang.org` forever.
+A file's `kinds` **replace** the defaults (`claude`, `opencode-go`, `jcode`, `qwen`, `kimi`).
+Nothing secret belongs in defaults or source: the module is published, and a published
+`path@version` is cached by `proxy.golang.org` forever.
 
 ## Development
 
-This repository lives here, on GitHub. Changes go through a pull request into
-`develop`; `main` moves only by a numbered release. CI is `.github/workflows/test.yml`:
-build, test, gofmt, vet, `go mod tidy` drift, the race detector, and an integration job
-against a real tmux.
+This repository lives here, on GitHub. Changes go through a pull request into `develop`;
+`main` moves only by a numbered release. CI is `.github/workflows/test.yml`: build, test,
+gofmt, vet, `go mod tidy` drift, the race detector, an integration job against a real tmux, and
+a release dry run.
 
-## Status
-
-Early — no release tag yet, so `@latest` resolves to the skeleton on `main` and **fails**
-("module does not contain package"). Until the first release, install the current
-development line with:
-
-```sh
-go install github.com/sparkflow-space/sparkflow-agentd/cmd/sparkflow-agentd@develop
-```
-
-Contract and design: `AGENTD-001` / "CLI Agent Sessions" in the project vault.
+The host channel's contract is `api/proto/agent/v1/hostchannel.proto`, vendored from
+`agent-sessions`. Design: "CLI Agent Sessions" in the project vault (AGENTD-001, AGENTD-003).

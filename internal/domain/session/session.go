@@ -101,7 +101,7 @@ type Live struct {
 // string matching.
 var (
 	ErrUnknownKind      = errors.New("agentd: kind is not in the allow-list")
-	ErrWorkspaceEscapes = errors.New("agentd: workspace is outside the configured root")
+	ErrWorkspaceEscapes = errors.New("agentd: the working folder is outside your home directory")
 	ErrWorkspaceEmpty   = errors.New("agentd: workspace is required")
 	ErrBadTransition    = errors.New("agentd: illegal state transition")
 	ErrNotFound         = errors.New("agentd: no such session")
@@ -110,7 +110,34 @@ var (
 	ErrUnknownSignal    = errors.New("agentd: unknown signal")
 	ErrTooManySessions  = errors.New("agentd: too many concurrent sessions")
 	ErrNoActor          = errors.New("agentd: unauthenticated")
+	ErrBadLabel         = errors.New("agentd: invalid session label")
 )
+
+// Dir is one entry of the working-folder picker: a directory, and whether it
+// is a git repository root.
+type Dir struct {
+	Name string
+	Git  bool
+}
+
+// ValidLabel accepts the label the server mints for a session's worktree and
+// branch (its session id): [A-Za-z0-9._-], 1..64, not starting with '.' or '-'.
+// It becomes a path segment and a git ref name, so nothing else gets through.
+func ValidLabel(l string) error {
+	if l == "" || len(l) > 64 || l[0] == '.' || l[0] == '-' {
+		return fmt.Errorf("%w: %q", ErrBadLabel, l)
+	}
+	for _, r := range l {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-'
+		if !ok {
+			return fmt.Errorf("%w: %q", ErrBadLabel, l)
+		}
+	}
+	if strings.Contains(l, "..") {
+		return fmt.Errorf("%w: %q", ErrBadLabel, l)
+	}
+	return nil
+}
 
 // Catalog is the daemon's allow-list: the agent kinds it will start, mapped to
 // the argv it runs.
@@ -145,8 +172,9 @@ func (c Catalog) Kinds() []string {
 	return out
 }
 
-// ValidateWorkspace resolves a caller-supplied workspace against the configured
-// root and refuses anything outside it.
+// ValidateWorkspace resolves a caller-supplied folder against the root — since
+// AGENTD-003 the owner's HOME, with both sides already symlink-resolved by the
+// caller — and refuses anything outside it.
 //
 // It is lexical on purpose and deliberately strict: `filepath.Clean` first, so
 // `/root/../etc` cannot sneak past a prefix test, and then a separator-aware

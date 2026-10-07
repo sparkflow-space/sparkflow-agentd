@@ -1,0 +1,214 @@
+// VENDORED byte-for-byte below this header from gitlab.com/sparkflow2/agent-sessions@8ef4638
+// (api/proto/agent/v1/hostchannel.proto). Change it there first, then re-vendor.
+// The host channel: how a sparkflow-agentd host talks to agent-sessions.
+//
+// The HOST dials. It opens one long-lived bidirectional stream through the
+// public ingress with its owner's access token (issued to the daemon's own
+// Zitadel client), and every operation on its sessions travels down that
+// stream. Nothing ever dials a host. Design: CLI Agent Sessions §Agent hosts.
+//
+// This file is the contract's single source. sparkflow-agentd (GitHub) vendors
+// it byte-for-byte; change it here first, then re-vendor there.
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "gitlab.com/sparkflow2/agent-sessions/internal/generated/agent/v1;agentv1";
+
+service HostChannel {
+  // RegisterHost enrols the calling device for the token's owner. Called by
+  // `sparkflow-agentd init`. Presenting a host_id the same owner already holds
+  // re-enrols that host (one host per device); a host_id of anybody else, or a
+  // revoked one, is refused.
+  rpc RegisterHost(RegisterHostRequest) returns (RegisterHostResponse);
+
+  // Connect is the channel. The first message up MUST be a Hello; the first
+  // message down is a Welcome or the stream ends with an error.
+  rpc Connect(stream HostMessage) returns (stream ServerMessage);
+}
+
+message RegisterHostRequest {
+  // Empty on a first enrolment; the stored id on a re-run of `init`.
+  string host_id = 1;
+  string name    = 2;
+  string os      = 3;
+  string arch    = 4;
+  string version = 5;
+  repeated string kinds = 6;
+}
+
+message RegisterHostResponse {
+  string host_id = 1;
+  string name    = 2;
+}
+
+// ---- up: host → server --------------------------------------------------
+
+message HostMessage {
+  oneof msg {
+    Hello        hello     = 1;
+    Result       result    = 2;
+    Output       output    = 3;
+    SessionEvent event     = 4;
+    Heartbeat    heartbeat = 5;
+  }
+}
+
+message Hello {
+  string host_id = 1;
+  string version = 2;
+  repeated string kinds = 3;
+  // What the host found running in tmux when it (re)connected.
+  repeated HostSession sessions = 4;
+}
+
+message HostSession {
+  string id         = 1;  // the host's own session id
+  string owner_sub  = 2;
+  string kind       = 3;
+  string workspace  = 4;
+  string state      = 5;  // starting | idle | working | waiting_input | exited
+  int64  created_at_unix_ms    = 6;
+  int64  last_activity_unix_ms = 7;
+}
+
+message Result {
+  string request_id = 1;
+  Error  error      = 2;  // unset on success
+  oneof payload {
+    HostSession started  = 3;
+    string      snapshot = 4;
+    DirListing  dirs     = 5;
+  }
+}
+
+message Error {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    NOT_FOUND        = 1;
+    INVALID_ARGUMENT = 2;
+    PERMISSION_DENIED = 3;  // e.g. an operation naming another owner
+    RESOURCE_EXHAUSTED = 4; // session limits
+    FAILED_PRECONDITION = 5;
+    INTERNAL         = 6;
+  }
+  Code   code    = 1;
+  string message = 2;
+}
+
+message DirListing {
+  string path = 1;  // absolute, after resolution
+  repeated Dir dirs = 2;
+}
+
+message Dir {
+  string name = 1;
+  bool   git  = 2;  // a repository root
+}
+
+message Output {
+  string session_id = 1;
+  uint64 seq        = 2;
+  bytes  data       = 3;
+  int64  ts_unix_ms = 4;
+  // The request_id of the SubscribeOp this chunk answers. Two viewers of one
+  // session (the web and the tablet) are two subscriptions with their own
+  // from_seq, so a chunk names which one it belongs to.
+  string subscription_id = 5;
+  // Set on the last message of a subscription (the session exited, or the
+  // host dropped a subscriber that fell too far behind); data is empty.
+  bool   end = 6;
+}
+
+message SessionEvent {
+  string session_id = 1;
+  string state      = 2;  // as HostSession.state
+  int64  ts_unix_ms = 3;
+}
+
+message Heartbeat {
+  int64 ts_unix_ms = 1;
+}
+
+// ---- down: server → host ------------------------------------------------
+
+message ServerMessage {
+  oneof msg {
+    Welcome   welcome   = 1;
+    Operation operation = 2;
+    Heartbeat heartbeat = 3;
+  }
+}
+
+message Welcome {
+  string name = 1;
+  int32  heartbeat_seconds = 2;
+}
+
+message Operation {
+  string request_id = 1;
+  // The person this operation is for. A host is single-owner and refuses any
+  // operation naming someone else, whoever sent it.
+  string owner_sub  = 2;
+  oneof op {
+    StartOp       start       = 3;
+    SendOp        send        = 4;
+    SignalOp      signal      = 5;
+    SnapshotOp    snapshot    = 6;
+    SubscribeOp   subscribe   = 7;
+    UnsubscribeOp unsubscribe = 8;
+    ListDirsOp    list_dirs   = 9;
+  }
+}
+
+message StartOp {
+  string kind   = 1;
+  // The working folder the person chose for this project on this host. The
+  // host re-checks it (under $HOME, no escaping symlink) and makes a fresh
+  // worktree when it is a git repository.
+  string folder = 2;
+  // A label for the worktree/branch, minted by the server (the session id).
+  string label  = 3;
+  repeated string env = 4;
+  int32  cols   = 5;
+  int32  rows   = 6;
+  // The first instruction (the brief), typed and submitted once the agent is up.
+  string brief  = 7;
+}
+
+message SendOp {
+  string session_id = 1;
+  string text       = 2;
+  bool   submit     = 3;
+}
+
+message SignalOp {
+  enum Sig {
+    SIG_UNSPECIFIED = 0;
+    INT  = 1;
+    TERM = 2;
+    KILL = 3;
+  }
+  string session_id = 1;
+  Sig    sig        = 2;
+}
+
+message SnapshotOp {
+  string session_id = 1;
+  int32  lines      = 2;
+}
+
+message SubscribeOp {
+  string session_id = 1;
+  uint64 from_seq   = 2;
+}
+
+message UnsubscribeOp {
+  string session_id      = 1;
+  string subscription_id = 2;  // the SubscribeOp's request_id
+}
+
+message ListDirsOp {
+  // Empty means the owner's home.
+  string path = 1;
+}
