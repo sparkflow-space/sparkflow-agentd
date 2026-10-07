@@ -184,7 +184,17 @@ func (c *CLI) Signal(ctx context.Context, s session.Session, sig session.Signal)
 			return err
 		}
 		if _, err := c.run(ctx, "kill-session", "-t", exact(s.TmuxName)); err != nil && !gone(err) {
-			return err
+			// tmux has more ways to say "it is gone" than gone() can list:
+			// "no current target" (an empty server kept alive by the control
+			// attach) and "server exited unexpectedly" (the server going down
+			// as we connect) were both met on dev on 2026-10-07. So ask the
+			// question directly — is the session still there? — and fail only
+			// when it is.
+			// …and believe only an answer that SAYS it is gone: a cancelled
+			// context or a crashed client is not evidence of anything.
+			if _, herr := c.run(ctx, "has-session", "-t", exact(s.TmuxName)); herr == nil || !gone(herr) {
+				return err
+			}
 		}
 		return nil
 	default:
@@ -226,6 +236,14 @@ func gone(err error) bool {
 		strings.Contains(msg, "can't find pane") ||
 		strings.Contains(msg, "no such session") ||
 		strings.Contains(msg, "no server running") ||
+		// The server is up but holds NO sessions at all — kept alive by the
+		// daemon's own control-mode attach after the agent's pane died.
+		// tmux 3.4 then cannot even resolve a "current" session for
+		// `kill-session -t =name` and says this instead of "can't find
+		// session". Measured on dev 2026-10-07: Stop's KILL failed with it
+		// for a session that was already gone, and the server kept the row
+		// "running" until the next reconcile.
+		strings.Contains(msg, "no current target") ||
 		strings.Contains(msg, os.ErrProcessDone.Error())
 }
 

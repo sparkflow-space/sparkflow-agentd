@@ -1,8 +1,10 @@
 # CLAUDE.md — sparkflow-agentd
 
 The host daemon for [[CLI Agent Sessions]]: it owns CLI-agent processes (`claude`,
-`opencode-go`, `qwen`, `kimi`, `z.ai`) as **tmux sessions** and serves them over gRPC to
-exactly one caller, the in-cluster `agent-sessions` service.
+`opencode-go`, `qwen`, `kimi`, …) as **tmux sessions** for ONE person, and since AGENTD-003
+(v0.2.0) it **dials out**: `init` enrols the device as one of that person's hosts, and `run`
+holds one outbound channel (`agent.v1.HostChannel`) to `agent-sessions`, over which every
+operation arrives. It opens no port.
 
 **This repository is different from every other one in the estate in two ways. Both matter
 before you touch anything.**
@@ -29,22 +31,34 @@ before you touch anything.**
   code inside the allow-listed binary *before* its `main`, and `BASH_ENV`,
   `PYTHONSTARTUP`, `NODE_OPTIONS`, `PERL5OPT` and `GIT_SSH_COMMAND` are the same hole in
   other spellings. Measured on this host, not theorised.
-- **A workspace must resolve under the configured root AND exist.** Validation is lexical
-  and deliberately strict (`/srv/agents-evil` is not a child of `/srv/agents`); the
-  existence check is separate because tmux answers `-c /does/not/exist` with exit 0 and
-  runs the agent in its OWN working directory.
+- **A working folder must resolve under the owner's HOME — after symlinks — AND exist.**
+  The folder is the one the person chose for the project (it arrives in `Start`); the check
+  is separator-aware (`/home/u-evil` is not inside `/home/u`), symlinks are resolved first
+  (a link inside home pointing at `/etc` is `/etc`), and existence is checked apart because
+  tmux answers `-c /does/not/exist` with exit 0 and runs the agent in its OWN directory.
+  A git repository gets a fresh worktree `<repo>/.claude/worktrees/<label>`.
 - **A session belongs to the person who started it.** `List` returns only the caller's
   own; every other RPC answers `NOT_FOUND` for a session it does not own, so an id is not
   an oracle. Ownership lives on the tmux session as `@sfagent_owner`, because tmux is what
   outlives the daemon.
-- **It refuses to bind a wildcard address**, and the address is PARSED — `[::0]` and
-  `[0:0:0:0:0:0:0:0]` are wildcards that a string comparison misses.
-- **The cluster→host hop is mutual TLS.** Plaintext only on loopback, only when asked for
-  by name. The token crossing that hop grants code execution here.
+- **A host is single-owner.** Every operation names its owner; `handler/channel` refuses and
+  audits anything naming someone other than the person who ran `init`. agent-sessions
+  already routes only that person's work here — this is the check that turns a misroute
+  upstream into a refusal instead of code running as the wrong person.
+- **No listening port; the bearer travels only over TLS** (`http://` is accepted for loopback
+  alone). `hostchannel.Target` enforces it.
+- **The credentials file is the crown jewel** (`~/.config/sparkflow-agentd/credentials.json`):
+  0700 dir, 0600 file, atomic writes, refused when group/other-readable. A rotated refresh
+  token is persisted BEFORE the new access token is used, or the next restart cannot sign in.
+- **Never print a token, a refresh token or an authorization code** — not in output, not in
+  an error, not in a test log. Only the sign-in URL is shown.
 - **Concurrency is capped** per person and per host.
-- **Every RPC carries a person's Zitadel JWT** — signature, expiry, **issuer and audience**.
-  The daemon *authenticates* its caller and never *authorises*: whether this human may
-  touch this project was decided upstream, by the only service that knows about projects.
+- **The daemon never *authorises* projects**: whether this human may touch this project was
+  decided upstream, by the only service that knows about projects. It enforces only "this is
+  my owner" and its own allow-lists.
+- **`init` takes the same deployment flags as `sparkflow-sync`** (owner, 2026-10-06):
+  production by default, `--debug-dev` switches server + issuer + client id together. An
+  empty client id is "not provisioned", said in a sentence — never the other deployment's.
 - **Every ATTEMPT is audited** with the verified identity — refusals and errors as well as
   successes, and reads (`Snapshot`, `Stream`, `List`) as well as writes. A success-only log
   is blind to exactly the traffic worth reading: somebody enumerating kinds or probing
@@ -55,8 +69,10 @@ before you touch anything.**
 ## Layering
 
 `Handler → Application → Domain ← Infra`, enforced by `internal/archtest`. The
-`applicationThirdParty` allow-list is **empty on purpose** — the use cases reach tmux and
-the verifier only through ports. Adding an entry is a design decision; say why in the PR.
+`applicationThirdParty` allow-list is **empty on purpose** — the use cases reach tmux, the
+filesystem and the IdP only through ports. `init`'s ports are in `domain/host`; the adapters
+from infra to them live in `cmd/sparkflow-agentd/adapters.go`, because infra may not import
+application or handler (the gate caught `infra/hostchannel` importing `handler/channel` once). Adding an entry is a design decision; say why in the PR.
 
 **This repo's copy of `layering_test.go` also judges the HANDLER layer**, which the shared
 version does not: `Handler → Application → Domain` says nothing about handler → infra, so a
