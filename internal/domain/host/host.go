@@ -38,13 +38,15 @@ var Production = Deployment{
 }
 
 // Dev is what `--debug-dev` selects. Its ClientID is the daemon's OWN Zitadel
-// client (not sparkflow-sync's): agent-sessions accepts only that client's
-// tokens on the host channel. It is created in GITOPS-179; until then it is
-// empty and `init --debug-dev` says so.
+// client (`agentd`, not sparkflow-sync's `cli`): agent-sessions accepts only
+// that client's tokens on the host channel. Created by gitops
+// remote-dev/zitadel/provision.sh (GITOPS-179, 2026-10-07): a public native
+// client, devMode off, redirects http://127.0.0.1/ (any port) and
+// https://sparkflow.ddns.net/agentd/code.
 var Dev = Deployment{
 	ServerURL: "https://sparkflow.ddns.net",
 	IssuerURL: "https://login.sparkflow.ddns.net",
-	ClientID:  "",
+	ClientID:  "394047772828895566",
 }
 
 // DeploymentFor is the starting triple; per-flag overrides apply on top.

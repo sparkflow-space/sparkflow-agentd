@@ -15,6 +15,12 @@ func TestDeploymentFor_MirrorsSparkflowSync(t *testing.T) {
 	if got := host.DeploymentFor(true); got.ServerURL != "https://sparkflow.ddns.net" || got.IssuerURL != "https://login.sparkflow.ddns.net" {
 		t.Errorf("--debug-dev must select dev, server and issuer together: %+v", got)
 	}
+	if err := host.Dev.Validate(); err != nil {
+		t.Errorf("the dev deployment carries its agentd client id: %v", err)
+	}
+	if host.Dev.ClientID == "377785512200504429" {
+		t.Error("the dev preset must be the daemon's OWN client, not sparkflow-sync's cli app")
+	}
 	if err := host.Production.Validate(); !errors.Is(err, host.ErrNotProvisioned) {
 		t.Errorf("an empty client id must say 'not provisioned', got %v", err)
 	}
