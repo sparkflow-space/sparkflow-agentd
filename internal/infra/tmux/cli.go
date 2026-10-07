@@ -184,7 +184,15 @@ func (c *CLI) Signal(ctx context.Context, s session.Session, sig session.Signal)
 			return err
 		}
 		if _, err := c.run(ctx, "kill-session", "-t", exact(s.TmuxName)); err != nil && !gone(err) {
-			return err
+			// tmux has more ways to say "it is gone" than gone() can list:
+			// "no current target" (an empty server kept alive by the control
+			// attach) and "server exited unexpectedly" (the server going down
+			// as we connect) were both met on dev on 2026-10-07. So ask the
+			// question directly — is the session still there? — and fail only
+			// when it is.
+			if _, herr := c.run(ctx, "has-session", "-t", exact(s.TmuxName)); herr == nil {
+				return err
+			}
 		}
 		return nil
 	default:
