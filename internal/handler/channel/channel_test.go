@@ -402,3 +402,75 @@ func TestRun_SubscribeThenImmediateUnsubscribe_AndDuplicateIDs(t *testing.T) {
 		t.Fatalf("both refused: %v / %v", first, second)
 	}
 }
+
+// silentServer accepts the stream and reads the Hello, then never answers —
+// what ingress-nginx did on dev on 2026-10-07 while it retried a dead pod IP
+// for the same request forever. (Or, with welcomeThenSilence, it answers and
+// then goes quiet: a half-open stream through a proxy.)
+type silentServer struct {
+	agentv1.UnimplementedHostChannelServer
+	hellos             chan *agentv1.Hello
+	welcomeThenSilence bool
+}
+
+func (s *silentServer) Connect(st agentv1.HostChannel_ConnectServer) error {
+	m, err := st.Recv()
+	if err != nil {
+		return err
+	}
+	s.hellos <- m.GetHello()
+	if s.welcomeThenSilence {
+		_ = st.Send(&agentv1.ServerMessage{Msg: &agentv1.ServerMessage_Welcome{Welcome: &agentv1.Welcome{Name: "x", HeartbeatSeconds: 1}}})
+	}
+	// Swallow whatever the host sends; never answer again.
+	for {
+		if _, err := st.Recv(); err != nil {
+			return nil
+		}
+	}
+}
+
+func runAgainst(t *testing.T, srv agentv1.HostChannelServer, handshake time.Duration) {
+	t.Helper()
+	lis := bufconn.Listen(1 << 20)
+	g := grpc.NewServer()
+	agentv1.RegisterHostChannelServer(g, srv)
+	go func() { _ = g.Serve(lis) }()
+	t.Cleanup(g.Stop)
+	cc, _ := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	t.Cleanup(func() { cc.Close() })
+	r := &channel.Runner{
+		Owner: "sub-A", HostID: "h1", MinBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond,
+		HandshakeTimeout: handshake,
+		Dial: func(ctx context.Context) (channel.Stream, error) {
+			return agentv1.NewHostChannelClient(cc).Connect(ctx)
+		},
+	}
+	r.Sessions = sessions.New(sessions.Deps{Tmux: &tmux{}, Workspaces: fs{}, Audit: &audit{}, Clock: clock{}, IDs: &ids{}, Catalog: session.Catalog{"claude": {"claude"}}, Home: "/home/a"})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = r.Run(ctx) }()
+}
+
+func TestRun_ANeverAnsweredHandshakeIsRetried(t *testing.T) {
+	srv := &silentServer{hellos: make(chan *agentv1.Hello, 8)}
+	runAgainst(t, srv, 100*time.Millisecond)
+	wait(t, srv.hellos)
+	// Without a handshake deadline the daemon waits for Welcome forever.
+	wait(t, srv.hellos)
+}
+
+func TestRun_AServerThatGoesSilentIsLeft(t *testing.T) {
+	srv := &silentServer{hellos: make(chan *agentv1.Hello, 8), welcomeThenSilence: true}
+	runAgainst(t, srv, time.Second)
+	wait(t, srv.hellos)
+	// Heartbeats every second were promised; three missed means the stream
+	// is dead even if TCP says otherwise — so a second Hello within ~4 s.
+	select {
+	case <-srv.hellos:
+	case <-time.After(8 * time.Second):
+		t.Fatal("the daemon stayed on a silent stream")
+	}
+}
