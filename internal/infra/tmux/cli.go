@@ -190,7 +190,9 @@ func (c *CLI) Signal(ctx context.Context, s session.Session, sig session.Signal)
 			// as we connect) were both met on dev on 2026-10-07. So ask the
 			// question directly — is the session still there? — and fail only
 			// when it is.
-			if _, herr := c.run(ctx, "has-session", "-t", exact(s.TmuxName)); herr == nil {
+			// …and believe only an answer that SAYS it is gone: a cancelled
+			// context or a crashed client is not evidence of anything.
+			if _, herr := c.run(ctx, "has-session", "-t", exact(s.TmuxName)); herr == nil || !gone(herr) {
 				return err
 			}
 		}

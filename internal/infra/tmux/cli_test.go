@@ -111,6 +111,27 @@ func TestCLISignalKill_IsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCLISignalKill_TrustsOnlyAGoneAnswerFromHasSession(t *testing.T) {
+	cases := []struct {
+		name, fail string
+		wantErr    bool
+	}{
+		{"kill failed, has-session says it is gone", "display-message\tcan't find pane: %0\nkill-session\tserver exited unexpectedly\nhas-session\tcan't find session: sfagent-x", false},
+		{"kill failed, the session is still there", "display-message\tcan't find pane: %0\nkill-session\tserver exited unexpectedly", true},
+		{"kill failed, has-session failed for another reason", "display-message\tcan't find pane: %0\nkill-session\tlost server\nhas-session\tprotocol version mismatch", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := newFakeDir(t)
+			d.write("fail", c.fail)
+			err := tmux.NewCLI(d.bin()).Signal(context.Background(), sample(), session.SignalKill)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, want error: %v", err, c.wantErr)
+			}
+		})
+	}
+}
+
 func TestCLISignal_TermIsARealSignalNotCtrlD(t *testing.T) {
 	d := newFakeDir(t)
 	// display-message answers with something that is NOT a pid, so signalPane
