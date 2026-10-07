@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,40 +56,81 @@ func Target(serverURL string) (string, bool, error) {
 	return "", false, fmt.Errorf("server %q: unsupported scheme", serverURL)
 }
 
+// ErrReEnrolled is a credentials file that names another host or person than
+// this process was started with: `init` ran again. This process is stale and
+// must not write its old sign-in back over the new one.
+var ErrReEnrolled = errors.New("this device was enrolled again (sparkflow-agentd init) — this process is stale; start it again")
+
 // Tokens hands out a valid access token, refreshing when needed.
 type Tokens struct {
 	mu    sync.Mutex
 	creds host.Credentials
 	oidc  *zitadel.Client
 	save  func(host.Credentials) error
+	load  func() (*host.Credentials, error)
 	now   func() time.Time
+	// dirty: a rotation the disk has not taken yet. Kept in memory and
+	// retried — the IdP has already invalidated the old refresh token, so
+	// dropping the new one would end the enrolment over a full disk.
+	dirty bool
+	// OnSaveError is told when a rotation could not be written (logged).
+	OnSaveError func(error)
 }
 
-// NewTokens wraps stored credentials. save persists rotations; it runs BEFORE
-// a new access token is used, because a rotated refresh token that was not
-// written down is a device that cannot reconnect after its next restart.
-func NewTokens(c host.Credentials, oidc *zitadel.Client, save func(host.Credentials) error) *Tokens {
-	return &Tokens{creds: c, oidc: oidc, save: save, now: time.Now}
+// NewTokens wraps stored credentials. save persists rotations; load re-reads
+// the file so a stale process never overwrites a newer enrolment.
+func NewTokens(c host.Credentials, oidc *zitadel.Client, save func(host.Credentials) error, load func() (*host.Credentials, error)) *Tokens {
+	return &Tokens{creds: c, oidc: oidc, save: save, load: load, now: time.Now}
+}
+
+// persist writes the current credentials unless the file now belongs to a
+// newer enrolment.
+func (t *Tokens) persist() error {
+	if t.load != nil {
+		if onDisk, err := t.load(); err == nil && onDisk != nil &&
+			(onDisk.HostID != t.creds.HostID || onDisk.OwnerSub != t.creds.OwnerSub) {
+			return ErrReEnrolled
+		}
+	}
+	if err := t.save(t.creds); err != nil {
+		t.dirty = true
+		if t.OnSaveError != nil {
+			t.OnSaveError(err)
+		}
+		return nil
+	}
+	t.dirty = false
+	return nil
 }
 
 // Access returns a token with at least a minute left.
 func (t *Tokens) Access(ctx context.Context) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.dirty {
+		if err := t.persist(); err != nil {
+			return "", err
+		}
+	}
 	if t.creds.AccessToken != "" && t.now().Add(time.Minute).Before(t.creds.ExpiresAt) {
 		return t.creds.AccessToken, nil
+	}
+	if t.load != nil {
+		if onDisk, err := t.load(); err == nil && onDisk != nil &&
+			(onDisk.HostID != t.creds.HostID || onDisk.OwnerSub != t.creds.OwnerSub) {
+			return "", ErrReEnrolled
+		}
 	}
 	tok, err := t.oidc.Refresh(ctx, t.creds.TokenEndpoint, t.creds.Deployment.ClientID, t.creds.RefreshToken)
 	if err != nil {
 		return "", err
 	}
-	next := t.creds
-	next.AccessToken, next.RefreshToken, next.ExpiresAt = tok.AccessToken, tok.RefreshToken, tok.ExpiresAt
-	if err := t.save(next); err != nil {
-		return "", fmt.Errorf("persisting the rotated sign-in: %w", err)
+	// In memory FIRST: the IdP has rotated the old token away already.
+	t.creds.AccessToken, t.creds.RefreshToken, t.creds.ExpiresAt = tok.AccessToken, tok.RefreshToken, tok.ExpiresAt
+	if err := t.persist(); err != nil {
+		return "", err
 	}
-	t.creds = next
-	return next.AccessToken, nil
+	return t.creds.AccessToken, nil
 }
 
 // bearer is per-RPC credentials carrying one token.
@@ -170,15 +212,25 @@ func Register(ctx context.Context, serverURL, accessToken string, req *agentv1.R
 }
 
 // Permanent says whether a channel error cannot be fixed by retrying: the
-// host was revoked or is unknown to the server, or the sign-in is gone. The
-// service manager is told not to restart on those (exit status 3).
+// host was revoked or is unknown to agent-sessions, the sign-in is gone, or
+// the device was enrolled again. The service manager is told not to restart
+// on those (exit status 3).
+//
+// Only an answer FROM agent-sessions counts. grpc-go turns a proxy's HTTP 403
+// or 404 — an ingress or oauth2-proxy mid-redeploy — into PermissionDenied or
+// NotFound too, with "unexpected HTTP status code" in the message; treating
+// that as final would take a host offline for good over a blip.
 func Permanent(err error) bool {
-	if errors.Is(err, zitadel.ErrSignInAgain) {
+	if errors.Is(err, zitadel.ErrSignInAgain) || errors.Is(err, ErrReEnrolled) {
 		return true
 	}
 	var se interface{ GRPCStatus() *status.Status }
 	if errors.As(err, &se) {
-		switch se.GRPCStatus().Code() {
+		st := se.GRPCStatus()
+		if strings.Contains(st.Message(), "unexpected HTTP status code") || strings.Contains(st.Message(), "unexpected content-type") {
+			return false
+		}
+		switch st.Code() {
 		case codes.PermissionDenied, codes.NotFound:
 			return true
 		}

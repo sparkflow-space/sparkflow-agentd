@@ -92,4 +92,8 @@ type Service interface {
 	Install(ctx context.Context) (ServiceResult, error)
 	// Commands are the manual equivalent, printed when the person declines.
 	Commands() []string
+	// Active and Restart: a re-enrolment must restart a running daemon, or it
+	// keeps the old enrolment in memory.
+	Active(ctx context.Context) bool
+	Restart(ctx context.Context) error
 }

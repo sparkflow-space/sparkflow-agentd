@@ -61,6 +61,8 @@ type Workspaces interface {
 	ListDirs(path string) ([]session.Dir, error)
 	// AddWorktree creates a fresh worktree of repo at path on a new branch.
 	AddWorktree(ctx context.Context, repo, path, branch string) error
+	// RemoveWorktree undoes AddWorktree (a Start that failed after it).
+	RemoveWorktree(ctx context.Context, repo, path, branch string) error
 }
 
 // Events tells the server about a session's state changes (the host channel

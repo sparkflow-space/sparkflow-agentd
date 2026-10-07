@@ -39,7 +39,7 @@ func TestSystemdUnit_Golden(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"ExecStart=/home/boris/go/bin/sparkflow-agentd run\n",
+		"ExecStart=\"/home/boris/go/bin/sparkflow-agentd\" run\n",
 		"Restart=on-failure\n",
 		"RestartPreventExitStatus=3\n",
 		`Environment="PATH=/home/boris/.local/bin:/usr/bin"`,
@@ -57,6 +57,28 @@ func TestLaunchAgent_Golden(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("plist lacks %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestRender_EscapesWhatTheFileWouldInterpret(t *testing.T) {
+	m := mgr(t, "linux", &fakeRunner{})
+	m.Binary = "/home/b/My Tools/100%/$HOME/sparkflow-agentd"
+	m.PATH = "/opt/50%/bin:/usr/bin"
+	got, err := m.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `ExecStart="/home/b/My Tools/100%%/$$HOME/sparkflow-agentd" run`) {
+		t.Errorf("ExecStart must be quoted with %% and $ escaped:\n%s", got)
+	}
+	if !strings.Contains(got, `Environment="PATH=/opt/50%%/bin:/usr/bin"`) {
+		t.Errorf("PATH must have %% escaped:\n%s", got)
+	}
+	d := mgr(t, "darwin", &fakeRunner{})
+	d.Binary, d.Home = "/Users/a&b/bin/sparkflow-agentd", "/Users/a&b"
+	got, _ = d.Render()
+	if strings.Contains(got, "a&b") || !strings.Contains(got, "a&amp;b") {
+		t.Errorf("plist fields must be XML-escaped:\n%s", got)
 	}
 }
 

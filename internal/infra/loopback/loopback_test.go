@@ -48,7 +48,14 @@ func TestLoopback_OneCodeWithOurState(t *testing.T) {
 func TestLoopback_IdPErrorEndsTheWait(t *testing.T) {
 	l, _ := loopback.Start("S1")
 	defer l.Close()
-	resp, err := http.Get(l.RedirectURI() + "?error=access_denied&error_description=user+cancelled")
+	// A forged error without our state is ignored…
+	if resp, err := http.Get(l.RedirectURI() + "?error=forged"); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("a stateless error must be refused: %d", resp.StatusCode)
+		}
+	}
+	resp, err := http.Get(l.RedirectURI() + "?error=access_denied&error_description=user+cancelled&state=S1")
 	if err != nil {
 		t.Fatal(err)
 	}

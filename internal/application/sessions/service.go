@@ -36,6 +36,10 @@ type Service struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*session.Session
+	// reserved counts Starts admitted but not yet in the map, per owner: the
+	// limit check and the insert are minutes apart (git, tmux), and without a
+	// reservation twenty concurrent Starts all pass a limit of eight.
+	reserved map[string]int
 }
 
 // Limits bound how much of the host one caller — and everybody together — may
@@ -101,6 +105,7 @@ func New(d Deps) *Service {
 		limits: d.Limits, events: d.Events,
 		briefWait: d.BriefWait, briefSettle: d.BriefSettle,
 		sessions: map[string]*session.Session{},
+		reserved: map[string]int{},
 	}
 }
 
@@ -157,14 +162,22 @@ func (s *Service) Start(ctx context.Context, actor session.Actor, p StartParams)
 	if err := s.admit(actor.Subject); err != nil {
 		return fail(err)
 	}
+	inserted := false
+	defer func() {
+		if !inserted {
+			s.release(actor.Subject)
+		}
+	}()
 	// A repository gets a fresh worktree per session, so two sessions never
 	// share a working tree; a plain folder is used as it is.
 	workspace := folder
+	var undo func()
 	if s.dirs.IsGitRoot(folder) {
-		workspace = filepath.Join(folder, ".claude", "worktrees", p.Label)
-		if err := s.dirs.AddWorktree(ctx, folder, workspace, "agent/"+p.Label); err != nil {
+		wt, cleanup, err := s.worktree(ctx, folder, p.Label)
+		if err != nil {
 			return fail(err)
 		}
+		workspace, undo = wt, cleanup
 	}
 
 	cols, rows := session.NormaliseSize(p.Cols, p.Rows)
@@ -178,12 +191,19 @@ func (s *Service) Start(ctx context.Context, actor session.Actor, p StartParams)
 
 	paneID, err := s.tmux.Start(ctx, *sess, argv, p.Env)
 	if err != nil {
+		if undo != nil {
+			undo() // a retry with the same label must find no leftover
+		}
 		return fail(fmt.Errorf("start %s: %w", p.Kind, err))
 	}
 	sess.PaneID = paneID
 
 	s.mu.Lock()
 	s.sessions[id] = sess
+	if s.reserved[actor.Subject]--; s.reserved[actor.Subject] <= 0 {
+		delete(s.reserved, actor.Subject)
+	}
+	inserted = true
 	s.mu.Unlock()
 
 	// Buffering starts NOW, not when a client first connects: the first thing an
@@ -376,10 +396,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 // admit enforces the concurrency limits. Counts exclude exited sessions, which
 // linger in the map as history.
+// admit enforces the concurrency limits and RESERVES a slot; the caller must
+// call release on every path that does not insert the session.
 func (s *Service) admit(owner string) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var total, mine int
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mine := s.reserved[owner]
+	total := 0
+	for _, n := range s.reserved {
+		total += n
+	}
 	for _, v := range s.sessions {
 		if v.State == session.StateExited {
 			continue
@@ -395,7 +421,16 @@ func (s *Service) admit(owner string) error {
 	if total >= s.limits.Total {
 		return fmt.Errorf("%w: %d already running on this host (limit %d)", session.ErrTooManySessions, total, s.limits.Total)
 	}
+	s.reserved[owner]++
 	return nil
+}
+
+func (s *Service) release(owner string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reserved[owner]--; s.reserved[owner] <= 0 {
+		delete(s.reserved, owner)
+	}
 }
 
 // own resolves a session and checks that it belongs to the caller.
@@ -552,4 +587,35 @@ func (s *Service) emit(id string, st session.State) {
 	if s.events != nil {
 		s.events.SessionState(id, st)
 	}
+}
+
+// worktree creates the session's worktree inside a repository and checks that
+// it really lies under the owner's home — AFTER git made it. The folder was
+// checked, but a `.claude` (or `.claude/worktrees`) symlink in the repository
+// would carry the worktree, and the agent, anywhere; resolving the created
+// path is the only check that sees where it actually went. It runs under its
+// own context: a dropped channel must not kill git half-way through.
+func (s *Service) worktree(ctx context.Context, repo, label string) (string, func(), error) {
+	ctx = context.WithoutCancel(ctx)
+	path := filepath.Join(repo, ".claude", "worktrees", label)
+	branch := "agent/" + label
+	// Refuse up front when the parent already resolves outside the home.
+	if real, err := s.dirs.Resolve(filepath.Join(repo, ".claude")); err == nil {
+		if _, err := session.ValidateWorkspace(s.home, real); err != nil {
+			return "", nil, fmt.Errorf("%w: %s/.claude points outside your home", session.ErrWorkspaceEscapes, repo)
+		}
+	}
+	if err := s.dirs.AddWorktree(ctx, repo, path, branch); err != nil {
+		return "", nil, err
+	}
+	undo := func() { _ = s.dirs.RemoveWorktree(ctx, repo, path, branch) }
+	real, err := s.dirs.Resolve(path)
+	if err == nil {
+		_, err = session.ValidateWorkspace(s.home, real)
+	}
+	if err != nil {
+		undo()
+		return "", nil, fmt.Errorf("%w: the worktree for %s landed outside your home", session.ErrWorkspaceEscapes, label)
+	}
+	return real, undo, nil
 }

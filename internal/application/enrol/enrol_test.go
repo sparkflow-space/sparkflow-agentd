@@ -139,7 +139,12 @@ func (s *store) Where() string                    { return "~/.config/sparkflow-
 type service struct {
 	installed bool
 	fail      bool
+	active    bool
+	restarts  int
 }
+
+func (s *service) Active(context.Context) bool   { return s.active }
+func (s *service) Restart(context.Context) error { s.restarts++; return nil }
 
 func (s *service) Install(context.Context) (host.ServiceResult, error) {
 	if s.fail {
@@ -302,5 +307,18 @@ func TestInit_AFailedServiceInstallIsNotReportedAsInstalled(t *testing.T) {
 	}
 	if res.Service != nil || strings.Contains(w.p.all(), "Installed and started") || !strings.Contains(w.p.all(), "by hand") {
 		t.Errorf("%+v\n%s", res, w.p.all())
+	}
+}
+
+func TestInit_ReEnrolmentRestartsTheRunningService(t *testing.T) {
+	w := newWorld()
+	w.st.c = &host.Credentials{HostID: "h-old", OwnerSub: "sub-A"}
+	w.svc.active = true
+	w.rd.code <- "C"
+	if _, err := enrol.Run(context.Background(), w.d, enrol.Options{Deployment: dev, Yes: true}); err != nil {
+		t.Fatal(err)
+	}
+	if w.svc.restarts != 1 || w.svc.installed {
+		t.Fatalf("a running daemon must be restarted, not reinstalled: restarts=%d installed=%v", w.svc.restarts, w.svc.installed)
 	}
 }

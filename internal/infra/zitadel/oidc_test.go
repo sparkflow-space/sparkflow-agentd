@@ -108,16 +108,16 @@ func TestParsePasted(t *testing.T) {
 	ok := map[string]string{
 		"abc123":     "abc123",
 		"  abc123\n": "abc123",
-		"http://127.0.0.1:43117/?code=XYZ&state=S1":           "XYZ",
-		"https://sparkflow.ddns.net/agentd/code?code=XYZ":     "XYZ",
-		"http://127.0.0.1:43117/callback?state=S1&code=Q%2BW": "Q+W",
+		"http://127.0.0.1:43117/?code=XYZ&state=S1":                "XYZ",
+		"https://sparkflow.ddns.net/agentd/code?code=XYZ&state=S1": "XYZ",
+		"http://127.0.0.1:43117/callback?state=S1&code=Q%2BW":      "Q+W",
 	}
 	for in, want := range ok {
 		if got, err := zitadel.ParsePasted(in, "S1"); err != nil || got != want {
 			t.Errorf("ParsePasted(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, bad := range []string{"", "http://127.0.0.1/?code=X&state=OTHER", "http://127.0.0.1/?state=S1", "two words", "http://127.0.0.1/?error=access_denied"} {
+	for _, bad := range []string{"", "http://127.0.0.1/?code=X&state=OTHER", "http://127.0.0.1/?state=S1", "two words", "http://127.0.0.1/?error=access_denied&state=OTHER", "http://127.0.0.1/?code=X", "http://127.0.0.1/?error=access_denied&state=S1"} {
 		if _, err := zitadel.ParsePasted(bad, "S1"); err == nil {
 			t.Errorf("ParsePasted(%q) must fail", bad)
 		}

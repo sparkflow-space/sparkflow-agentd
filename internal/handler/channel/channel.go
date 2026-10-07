@@ -189,8 +189,9 @@ func (r *Runner) once(ctx context.Context) error {
 		}
 	}()
 
-	subs := &subscriptions{m: map[string]context.CancelFunc{}}
+	subs := &subscriptions{m: map[string]*subEntry{}}
 	defer subs.cancelAll()
+	queues := &queues{m: map[string]chan func(){}, ctx: ctx}
 	recvErr := make(chan error, 1)
 	go func() {
 		for {
@@ -199,7 +200,17 @@ func (r *Runner) once(ctx context.Context) error {
 				recvErr <- err
 				return
 			}
-			if op := m.GetOperation(); op != nil {
+			op := m.GetOperation()
+			if op == nil {
+				continue
+			}
+			// Operations on ONE session run in the order they arrived: a Send
+			// then an Enter, or a Send then an INT, must reach tmux in that
+			// order. Different sessions — and Start and ListDirs, which name
+			// none — run concurrently.
+			if key := sessionKey(op); key != "" {
+				queues.push(key, func() { r.handle(ctx, op, out, subs) })
+			} else {
 				go r.handle(ctx, op, out, subs)
 			}
 		}
@@ -214,32 +225,98 @@ func (r *Runner) once(ctx context.Context) error {
 	}
 }
 
-type subscriptions struct {
-	mu sync.Mutex
-	m  map[string]context.CancelFunc
+// queues runs each session's operations one at a time, in arrival order.
+type queues struct {
+	mu  sync.Mutex
+	m   map[string]chan func()
+	ctx context.Context
 }
 
-func (s *subscriptions) add(id string, c context.CancelFunc) {
+func (q *queues) push(key string, f func()) {
+	q.mu.Lock()
+	ch, ok := q.m[key]
+	if !ok {
+		ch = make(chan func(), 64)
+		q.m[key] = ch
+		go func() {
+			for {
+				select {
+				case f := <-ch:
+					f()
+				case <-q.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	q.mu.Unlock()
+	select {
+	case ch <- f:
+	case <-q.ctx.Done():
+	}
+}
+
+func sessionKey(op *agentv1.Operation) string {
+	switch x := op.GetOp().(type) {
+	case *agentv1.Operation_Send:
+		return x.Send.GetSessionId()
+	case *agentv1.Operation_Signal:
+		return x.Signal.GetSessionId()
+	case *agentv1.Operation_Snapshot:
+		return x.Snapshot.GetSessionId()
+	case *agentv1.Operation_Subscribe:
+		return x.Subscribe.GetSessionId()
+	case *agentv1.Operation_Unsubscribe:
+		return x.Unsubscribe.GetSessionId()
+	}
+	return ""
+}
+
+type subEntry struct{ cancel context.CancelFunc }
+
+type subscriptions struct {
+	mu sync.Mutex
+	m  map[string]*subEntry
+}
+
+// add registers a subscription; a duplicate id is refused rather than
+// silently replacing — and leaking — the live one.
+func (s *subscriptions) add(id string, c context.CancelFunc) (*subEntry, bool) {
 	s.mu.Lock()
-	s.m[id] = c
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if _, dup := s.m[id]; dup {
+		return nil, false
+	}
+	e := &subEntry{cancel: c}
+	s.m[id] = e
+	return e, true
 }
 
 func (s *subscriptions) cancel(id string) {
 	s.mu.Lock()
-	c := s.m[id]
+	e := s.m[id]
 	delete(s.m, id)
 	s.mu.Unlock()
-	if c != nil {
-		c()
+	if e != nil {
+		e.cancel()
 	}
+}
+
+// drop removes the entry only if it is still THIS one.
+func (s *subscriptions) drop(id string, e *subEntry) {
+	s.mu.Lock()
+	if s.m[id] == e {
+		delete(s.m, id)
+	}
+	s.mu.Unlock()
+	e.cancel()
 }
 
 func (s *subscriptions) cancelAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, c := range s.m {
-		c()
+	for id, e := range s.m {
+		e.cancel()
 		delete(s.m, id)
 	}
 }
@@ -322,9 +399,21 @@ func (r *Runner) subscribe(ctx context.Context, actor session.Actor, op *agentv1
 		return
 	}
 	id := op.GetRequestId()
-	subs.add(id, cancel)
+	entry, ok := subs.add(id, cancel)
+	if !ok {
+		cancel()
+		reply(&agentv1.Result{Error: &agentv1.Error{Code: agentv1.Error_INVALID_ARGUMENT, Message: "a subscription with this id is already open"}})
+		return
+	}
 	reply(&agentv1.Result{})
-	defer subs.cancel(id)
+	// Registered and answered inside the session's queue; forwarding runs on
+	// its own so the queue — and an Unsubscribe behind it — is not blocked.
+	go r.forward(ctx, subCtx, s, id, ch, out, func() { subs.drop(id, entry) })
+}
+
+func (r *Runner) forward(ctx, subCtx context.Context, s *agentv1.SubscribeOp, id string, ch <-chan session.Chunk,
+	out chan<- *agentv1.HostMessage, done func()) {
+	defer done()
 	for {
 		select {
 		case c, ok := <-ch:

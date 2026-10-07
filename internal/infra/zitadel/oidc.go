@@ -229,8 +229,10 @@ func randomURLSafe(n int) (string, error) {
 }
 
 // ParsePasted turns what a person pasted — the whole address from the
-// browser's address bar, or just the code — into a code. When the address
-// carries a state, it must be ours.
+// browser's address bar, or just the code — into a code. A pasted ADDRESS must
+// carry this attempt's state: the IdP always echoes it, so one without it (or
+// with another) is not from this sign-in. A bare code has no state to check;
+// it is worthless without this process's PKCE verifier anyway.
 func ParsePasted(pasted, wantState string) (string, error) {
 	s := strings.TrimSpace(pasted)
 	if s == "" {
@@ -242,11 +244,11 @@ func ParsePasted(pasted, wantState string) (string, error) {
 			return "", fmt.Errorf("that is not an address: %w", err)
 		}
 		q := u.Query()
+		if q.Get("state") != wantState {
+			return "", errors.New("that address does not belong to this sign-in attempt (state missing or different)")
+		}
 		if e := q.Get("error"); e != "" {
 			return "", fmt.Errorf("sign-in failed: %s %s", e, q.Get("error_description"))
-		}
-		if st := q.Get("state"); st != "" && st != wantState {
-			return "", errors.New("that address belongs to another sign-in attempt (state mismatch)")
 		}
 		code := q.Get("code")
 		if code == "" {

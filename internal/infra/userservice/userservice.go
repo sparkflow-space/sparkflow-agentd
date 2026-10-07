@@ -7,6 +7,7 @@ package userservice
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -60,14 +61,30 @@ func (m Manager) unitPath() string {
 	return filepath.Join(m.Home, ".config", "systemd", "user", unitName)
 }
 
-var systemdUnit = template.Must(template.New("unit").Parse(`[Unit]
+// funcs escape for the file each value lands in. systemd expands `%`
+// specifiers everywhere and `$VAR` in ExecStart, and splits an unquoted
+// ExecStart on whitespace; a plist is XML.
+var funcs = template.FuncMap{
+	"exec": func(v string) string {
+		v = strings.ReplaceAll(v, "%", "%%")
+		return `"` + strings.ReplaceAll(v, "$", "$$") + `"`
+	},
+	"spec": func(v string) string { return strings.ReplaceAll(v, "%", "%%") },
+	"xml": func(v string) string {
+		var b strings.Builder
+		_ = xml.EscapeText(&b, []byte(v))
+		return b.String()
+	},
+}
+
+var systemdUnit = template.Must(template.New("unit").Funcs(funcs).Parse(`[Unit]
 Description=Sparkflow agent host (sparkflow-agentd)
 Documentation=https://github.com/sparkflow-space/sparkflow-agentd
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart={{.Binary}} run
+ExecStart={{exec .Binary}} run
 Restart=on-failure
 RestartSec=5
 # Exit status 3 means the host was revoked or the sign-in is gone: restarting
@@ -75,25 +92,25 @@ RestartSec=5
 RestartPreventExitStatus=3
 # The PATH sparkflow-agentd init ran with: a user service starts with a
 # minimal PATH and would not find agent CLIs installed in ~/.local/bin or by nvm.
-Environment="PATH={{.PATH}}"
+Environment="PATH={{spec .PATH}}"
 
 [Install]
 WantedBy=default.target
 `))
 
-var launchAgent = template.Must(template.New("plist").Parse(`<?xml version="1.0" encoding="UTF-8"?>
+var launchAgent = template.Must(template.New("plist").Funcs(funcs).Parse(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>` + launchLabel + `</string>
   <key>ProgramArguments</key>
-  <array><string>{{.Binary}}</string><string>run</string></array>
+  <array><string>{{xml .Binary}}</string><string>run</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{{.PATH}}</string></dict>
+  <dict><key>PATH</key><string>{{xml .PATH}}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>{{.Home}}/Library/Logs/sparkflow-agentd.log</string>
-  <key>StandardErrorPath</key><string>{{.Home}}/Library/Logs/sparkflow-agentd.log</string>
+  <key>StandardOutPath</key><string>{{xml .Home}}/Library/Logs/sparkflow-agentd.log</string>
+  <key>StandardErrorPath</key><string>{{xml .Home}}/Library/Logs/sparkflow-agentd.log</string>
 </dict>
 </plist>
 `))
@@ -103,8 +120,10 @@ func (m Manager) Render() (string, error) {
 	if !filepath.IsAbs(m.Binary) {
 		return "", fmt.Errorf("the service needs an absolute path to sparkflow-agentd, got %q", m.Binary)
 	}
-	if strings.ContainsAny(m.Binary+m.PATH, "\n\"<>&") {
-		return "", errors.New("the binary path or PATH contains characters a unit file cannot carry safely")
+	// What escaping cannot make safe: a line break ends the directive, and a
+	// quote or backslash changes how systemd reads the quoted value.
+	if strings.ContainsAny(m.Binary+m.PATH+m.Home, "\n\r\"\\") {
+		return "", errors.New("the binary path, PATH or home contains a line break, a quote or a backslash, which a unit file cannot carry safely")
 	}
 	var b bytes.Buffer
 	t := systemdUnit
@@ -199,4 +218,23 @@ func (m Manager) Status(ctx context.Context) string {
 	}
 	out, _ := m.Run.Run(ctx, "systemctl", "--user", "is-active", unitName)
 	return out
+}
+
+// Active reports whether the service is running now.
+func (m Manager) Active(ctx context.Context) bool {
+	st := m.Status(ctx)
+	return st == "active" || st == "running"
+}
+
+// Restart restarts a running service — after `init` re-enrolled the device,
+// so the daemon picks up the new credentials instead of carrying on with
+// (and, at its next refresh, refusing to overwrite) the old ones.
+func (m Manager) Restart(ctx context.Context) error {
+	var err error
+	if m.GOOS == "darwin" {
+		_, err = m.Run.Run(ctx, "launchctl", "kickstart", "-k", "gui/"+strconv.Itoa(m.UID)+"/"+launchLabel)
+	} else {
+		_, err = m.Run.Run(ctx, "systemctl", "--user", "restart", unitName)
+	}
+	return err
 }

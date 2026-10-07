@@ -113,6 +113,16 @@ func Run(ctx context.Context, d Deps, o Options) (Result, error) {
 	d.Prompter.Say(fmt.Sprintf("Registered host %q. Credentials: %s (readable by you only)", gotName, d.Store.Where()))
 
 	res := Result{HostID: newID, HostName: gotName, Email: signIn.Email, ReEnrolled: hostID != "" && hostID == newID}
+	// A daemon already running holds the OLD enrolment in memory; restart it
+	// so it uses the new one (it would refuse to write over it anyway).
+	if existing != nil && d.Service.Active(ctx) {
+		if err := d.Service.Restart(ctx); err != nil {
+			d.Prompter.Say("The running service still uses the previous enrolment; restart it: " + err.Error())
+		} else {
+			d.Prompter.Say("Restarted the running service with the new enrolment.")
+			return res, nil
+		}
+	}
 	if o.NoService {
 		say(d.Prompter, "To run it with the system:", d.Service.Commands())
 		return res, nil

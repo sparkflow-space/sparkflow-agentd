@@ -154,6 +154,9 @@ func (a serviceAdapter) Commands() []string {
 	return out
 }
 
+func (a serviceAdapter) Active(ctx context.Context) bool   { return a.m.Active(ctx) }
+func (a serviceAdapter) Restart(ctx context.Context) error { return a.m.Restart(ctx) }
+
 func indent(s string) string {
 	return "    " + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n    ")
 }

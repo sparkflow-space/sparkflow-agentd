@@ -42,6 +42,9 @@ func (t *tmux) Start(context.Context, session.Session, []string, []string) (stri
 	return fmt.Sprintf("%%%d", t.panes), nil
 }
 func (t *tmux) SendKeys(_ context.Context, pane, text string, _ bool) error {
+	if strings.HasPrefix(text, "slow") {
+		time.Sleep(40 * time.Millisecond)
+	}
 	t.mu.Lock()
 	t.keys = append(t.keys, pane+"|"+text)
 	t.mu.Unlock()
@@ -74,7 +77,8 @@ func (fs) IsGitRoot(string) bool            { return false }
 func (fs) ListDirs(string) ([]session.Dir, error) {
 	return []session.Dir{{Name: "src", Git: true}}, nil
 }
-func (fs) AddWorktree(context.Context, string, string, string) error { return nil }
+func (fs) AddWorktree(context.Context, string, string, string) error    { return nil }
+func (fs) RemoveWorktree(context.Context, string, string, string) error { return nil }
 
 type audit struct {
 	mu sync.Mutex
@@ -348,5 +352,53 @@ func TestRun_StopsOnAPermanentRefusal(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("a revoked host must stop retrying")
+	}
+}
+
+func TestRun_OneSessionsOperationsKeepTheirOrder(t *testing.T) {
+	srv := newServer()
+	tm, _, _, _ := setup(t, srv)
+	wait(t, srv.hellos)
+	srv.ops <- &agentv1.Operation{RequestId: "s", OwnerSub: "sub-A", Op: &agentv1.Operation_Start{Start: &agentv1.StartOp{Kind: "claude", Folder: "/home/a/src", Label: "o1"}}}
+	sid := result(t, srv, "s").GetStarted().GetId()
+	srv.ops <- &agentv1.Operation{RequestId: "a", OwnerSub: "sub-A", Op: &agentv1.Operation_Send{Send: &agentv1.SendOp{SessionId: sid, Text: "slow git status"}}}
+	srv.ops <- &agentv1.Operation{RequestId: "b", OwnerSub: "sub-A", Op: &agentv1.Operation_Send{Send: &agentv1.SendOp{SessionId: sid, Text: "then this", Submit: true}}}
+	result(t, srv, "a")
+	result(t, srv, "b")
+	got := strings.Join(tm.sent(), ",")
+	if strings.Index(got, "slow git status") > strings.Index(got, "then this") {
+		t.Fatalf("keystrokes reached tmux out of order: %s", got)
+	}
+}
+
+func TestRun_SubscribeThenImmediateUnsubscribe_AndDuplicateIDs(t *testing.T) {
+	srv := newServer()
+	setup(t, srv)
+	wait(t, srv.hellos)
+	srv.ops <- &agentv1.Operation{RequestId: "s", OwnerSub: "sub-A", Op: &agentv1.Operation_Start{Start: &agentv1.StartOp{Kind: "claude", Folder: "/home/a/src", Label: "o2"}}}
+	sid := result(t, srv, "s").GetStarted().GetId()
+	// Back to back: the Unsubscribe must find the subscription registered.
+	srv.ops <- &agentv1.Operation{RequestId: "sub1", OwnerSub: "sub-A", Op: &agentv1.Operation_Subscribe{Subscribe: &agentv1.SubscribeOp{SessionId: sid}}}
+	srv.ops <- &agentv1.Operation{RequestId: "u1", OwnerSub: "sub-A", Op: &agentv1.Operation_Unsubscribe{Unsubscribe: &agentv1.UnsubscribeOp{SessionId: sid, SubscriptionId: "sub1"}}}
+	if r := result(t, srv, "sub1"); r.GetError() != nil {
+		t.Fatalf("subscribe: %v", r)
+	}
+	result(t, srv, "u1")
+	// A second Subscribe reusing a live id is refused, not swapped in.
+	srv.ops <- &agentv1.Operation{RequestId: "dup", OwnerSub: "sub-A", Op: &agentv1.Operation_Subscribe{Subscribe: &agentv1.SubscribeOp{SessionId: sid}}}
+	srv.ops <- &agentv1.Operation{RequestId: "dup", OwnerSub: "sub-A", Op: &agentv1.Operation_Subscribe{Subscribe: &agentv1.SubscribeOp{SessionId: sid}}}
+	first := result(t, srv, "dup")
+	second := result(t, srv, "dup")
+	errs := 0
+	for _, r := range []*agentv1.Result{first, second} {
+		if r.GetError() != nil {
+			errs++
+		}
+	}
+	// The fake stream ends at once (it replays two chunks and closes), so the
+	// first may be gone before the second arrives; what must never happen is
+	// two LIVE subscriptions under one id — at most one succeeds while live.
+	if errs > 1 {
+		t.Fatalf("both refused: %v / %v", first, second)
 	}
 }

@@ -103,3 +103,23 @@ func (d Dirs) AddWorktree(ctx context.Context, repo, path, branch string) error 
 	_, _ = f.WriteString("\n# sparkflow-agentd: agent worktrees\n.claude/\n")
 	return nil
 }
+
+// RemoveWorktree undoes AddWorktree: the worktree (forced — it is fresh and
+// holds nothing of the person's) and its branch.
+func (d Dirs) RemoveWorktree(ctx context.Context, repo, path, branch string) error {
+	git := d.Git
+	if git == "" {
+		git = "git"
+	}
+	var errs []string
+	if out, err := exec.CommandContext(ctx, git, "-C", repo, "worktree", "remove", "--force", path).CombinedOutput(); err != nil {
+		errs = append(errs, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, git, "-C", repo, "branch", "-D", branch).CombinedOutput(); err != nil {
+		errs = append(errs, strings.TrimSpace(string(out)))
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("git cleanup: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}

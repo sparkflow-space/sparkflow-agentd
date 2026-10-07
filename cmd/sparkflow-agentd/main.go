@@ -205,7 +205,10 @@ func cmdRun(ctx context.Context) error {
 		return err
 	}
 
-	tokens := hostchannel.NewTokens(*creds, zitadel.New(), store.Save)
+	tokens := hostchannel.NewTokens(*creds, zitadel.New(), store.Save, store.Load)
+	tokens.OnSaveError = func(err error) {
+		log.Printf("warning: could not write the rotated sign-in to %s (%v); keeping it in memory and retrying", store.Path, err)
+	}
 	dialer := &hostchannel.Dialer{Target: target, Secure: secure, Tokens: tokens}
 	defer dialer.Close()
 

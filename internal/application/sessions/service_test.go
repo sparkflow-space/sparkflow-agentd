@@ -3,6 +3,7 @@ package sessions_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,9 +30,15 @@ type fakeTmux struct {
 	startErr  error
 	signalErr error
 	pane      string
+	// slow makes Start take time, outside the lock: the window concurrent
+	// Starts race through.
+	slow time.Duration
 }
 
 func (f *fakeTmux) Start(_ context.Context, s session.Session, _, env []string) (string, error) {
+	if f.slow > 0 {
+		time.Sleep(f.slow)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.startErr != nil {
@@ -145,7 +152,9 @@ type fakeDirs struct {
 	links     map[string]string // path → where it really points
 	git       map[string]bool
 	worktrees []string
+	removed   []string
 	listing   []session.Dir
+	raceLink  map[string]string // links that appear only once git runs
 }
 
 func (d *fakeDirs) IsDir(p string) bool { return d.dirs[p] }
@@ -167,6 +176,23 @@ func (d *fakeDirs) AddWorktree(_ context.Context, repo, path, branch string) err
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.worktrees = append(d.worktrees, repo+"|"+path+"|"+branch)
+	for k, v := range d.raceLink {
+		d.links[k] = v
+	}
+	if real, ok := d.links[filepath.Dir(filepath.Dir(path))]; ok {
+		// git followed a symlinked .claude: the worktree is really there.
+		d.links[path] = filepath.Join(real, "worktrees", filepath.Base(path))
+		d.dirs[d.links[path]] = true
+		return nil
+	}
+	d.dirs[path] = true
+	return nil
+}
+
+func (d *fakeDirs) RemoveWorktree(_ context.Context, repo, path, branch string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.removed = append(d.removed, repo+"|"+path+"|"+branch)
 	return nil
 }
 
@@ -517,6 +543,69 @@ func TestStart_FolderRules(t *testing.T) {
 				t.Fatalf("got %v, want %v", err, c.want)
 			}
 		})
+	}
+}
+
+func TestStart_ASymlinkedDotClaudeCannotCarryTheAgentOut(t *testing.T) {
+	d := newDirs()
+	d.dirs["/home/u/evil"] = true
+	d.git["/home/u/evil"] = true
+	// Created AFTER the folder check would have passed: only the post-check
+	// sees it.
+	h := newHarness(t, func(x *sessions.Deps) { x.Workspaces = d })
+	d.links["/home/u/evil/.claude"] = "/tmp/x"
+	_, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/evil", Label: "l1"})
+	if !errors.Is(err, session.ErrWorkspaceEscapes) {
+		t.Fatalf("a .claude symlink out of the home must be refused: %v", err)
+	}
+	if len(h.tmux.started) != 0 {
+		t.Fatal("nothing may start")
+	}
+	// The pre-check refused before git ran; now the race: the link appears
+	// between the pre-check and git (no link at pre-check time).
+	d2 := newDirs()
+	d2.dirs["/home/u/evil"], d2.git["/home/u/evil"] = true, true
+	h2 := newHarness(t, func(x *sessions.Deps) { x.Workspaces = d2 })
+	d2.raceLink = map[string]string{"/home/u/evil/.claude": "/tmp/x"}
+	_, err = h2.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/evil", Label: "l2"})
+	if !errors.Is(err, session.ErrWorkspaceEscapes) || len(d2.removed) != 1 {
+		t.Fatalf("a worktree that landed outside must be refused AND removed: %v removed=%v", err, d2.removed)
+	}
+}
+
+func TestStart_AFailedStartRemovesItsWorktree(t *testing.T) {
+	d := newDirs()
+	h := newHarness(t, func(x *sessions.Deps) { x.Workspaces = d })
+	h.tmux.startErr = errors.New("tmux: no server")
+	if _, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/repo", Label: "l1"}); err == nil {
+		t.Fatal("want the tmux error")
+	}
+	if len(d.removed) != 1 || d.removed[0] != "/home/u/repo|/home/u/repo/.claude/worktrees/l1|agent/l1" {
+		t.Fatalf("the worktree and branch must be removed so a retry can use the label: %v", d.removed)
+	}
+}
+
+func TestAdmit_ConcurrentStartsCannotExceedTheLimit(t *testing.T) {
+	h := newHarness(t, func(x *sessions.Deps) { x.Limits = sessions.Limits{PerOwner: 3, Total: 10} })
+	h.tmux.slow = 20 * time.Millisecond
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/p1", Label: fmt.Sprintf("c%d", i)})
+			if err == nil {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if ok != 3 {
+		t.Fatalf("12 concurrent Starts with a limit of 3 started %d", ok)
 	}
 }
 

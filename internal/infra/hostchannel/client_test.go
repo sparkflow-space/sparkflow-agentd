@@ -53,7 +53,7 @@ func TestTokens_RefreshPersistsBeforeUse(t *testing.T) {
 
 	var saved []host.Credentials
 	c := host.Credentials{TokenEndpoint: idp.URL, RefreshToken: "RT0", Deployment: host.Deployment{ClientID: "c"}}
-	tk := NewTokens(c, zitadel.New(), func(h host.Credentials) error { saved = append(saved, h); return nil })
+	tk := NewTokens(c, zitadel.New(), func(h host.Credentials) error { saved = append(saved, h); return nil }, nil)
 	a1, err := tk.Access(context.Background())
 	if err != nil || a1 != "AT1" {
 		t.Fatalf("%q %v", a1, err)
@@ -65,16 +65,35 @@ func TestTokens_RefreshPersistsBeforeUse(t *testing.T) {
 		t.Errorf("a valid token must be reused, not refreshed again (calls=%d)", calls)
 	}
 
-	// A save that fails must not hand out the new token: the rotation would
-	// be lost at the next restart.
+	// A save that fails keeps the rotation IN MEMORY and retries it: the IdP
+	// has already invalidated the old refresh token, so dropping the new one
+	// would end the enrolment over a full disk.
+	failing := true
+	var reported []error
+	var lastSaved host.Credentials
 	tk2 := NewTokens(host.Credentials{TokenEndpoint: idp.URL, RefreshToken: "RT9", Deployment: host.Deployment{ClientID: "c"}}, zitadel.New(),
-		func(host.Credentials) error { return errors.New("disk full") })
-	if _, err := tk2.Access(context.Background()); err == nil {
-		t.Fatal("want the save error")
+		func(h host.Credentials) error {
+			if failing {
+				return errors.New("disk full")
+			}
+			lastSaved = h
+			return nil
+		}, nil)
+	tk2.OnSaveError = func(err error) { reported = append(reported, err) }
+	if a, err := tk2.Access(context.Background()); err != nil || a == "" {
+		t.Fatalf("a failed save must still hand out the token: %q %v", a, err)
+	}
+	if len(reported) != 1 {
+		t.Fatalf("the failure must be reported: %v", reported)
+	}
+	failing = false
+	_, _ = tk2.Access(context.Background())
+	if lastSaved.RefreshToken == "" || lastSaved.RefreshToken == "RT9" {
+		t.Fatalf("the kept rotation must be written on the next call: %+v", lastSaved)
 	}
 
 	tk3 := NewTokens(host.Credentials{TokenEndpoint: idp.URL, RefreshToken: "dead", Deployment: host.Deployment{ClientID: "c"}}, zitadel.New(),
-		func(host.Credentials) error { return nil })
+		func(host.Credentials) error { return nil }, nil)
 	_, err = tk3.Access(context.Background())
 	if !Permanent(err) {
 		t.Fatalf("a dead sign-in is permanent: %v", err)
@@ -82,7 +101,31 @@ func TestTokens_RefreshPersistsBeforeUse(t *testing.T) {
 	_ = time.Second
 }
 
+func TestTokens_AStaleProcessNeverOverwritesANewEnrolment(t *testing.T) {
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "AT", "refresh_token": "RTx", "expires_in": 3600})
+	}))
+	defer idp.Close()
+	onDisk := &host.Credentials{HostID: "h-NEW", OwnerSub: "sub-B"} // init ran again
+	writes := 0
+	tk := NewTokens(host.Credentials{HostID: "h-old", OwnerSub: "sub-A", TokenEndpoint: idp.URL, RefreshToken: "RT", Deployment: host.Deployment{ClientID: "c"}},
+		zitadel.New(), func(host.Credentials) error { writes++; return nil }, func() (*host.Credentials, error) { return onDisk, nil })
+	if _, err := tk.Access(context.Background()); !errors.Is(err, ErrReEnrolled) || !Permanent(err) {
+		t.Fatalf("a re-enrolled device must stop the stale process: %v", err)
+	}
+	if writes != 0 {
+		t.Fatal("the stale process wrote its old sign-in over the new enrolment")
+	}
+}
+
 func TestPermanent(t *testing.T) {
+	// A proxy's 403/404 (ingress or oauth2-proxy redeploying) arrives with the
+	// same codes; it must be retried, not taken as "revoked".
+	for _, c := range []codes.Code{codes.PermissionDenied, codes.NotFound} {
+		if Permanent(status.Error(c, "unexpected HTTP status code received from server: 403 (Forbidden)")) {
+			t.Errorf("a proxy's %v must be retried", c)
+		}
+	}
 	for _, c := range []codes.Code{codes.PermissionDenied, codes.NotFound} {
 		if !Permanent(fmt.Errorf("connect: %w", status.Error(c, "x"))) {
 			t.Errorf("%v must be permanent", c)

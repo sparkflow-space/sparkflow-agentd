@@ -51,6 +51,12 @@ const page = `<!doctype html><meta charset="utf-8"><title>sparkflow-agentd</titl
 func (l *Listener) serve(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// State first, for errors too: any local process can guess the port, and
+	// must not be able to abort the sign-in with a forged ?error=.
+	if q.Get("state") != l.state {
+		http.Error(w, "this request does not belong to the sign-in in progress", http.StatusBadRequest)
+		return
+	}
 	if e := q.Get("error"); e != "" {
 		_, _ = fmt.Fprintf(w, page, "Sign-in failed.")
 		l.deliver(result{err: fmt.Errorf("sign-in failed: %s %s", e, q.Get("error_description"))})
@@ -59,12 +65,6 @@ func (l *Listener) serve(w http.ResponseWriter, r *http.Request) {
 	if q.Get("code") == "" {
 		// A favicon request, a scanner: not ours, not an answer.
 		http.Error(w, "no code", http.StatusBadRequest)
-		return
-	}
-	if q.Get("state") != l.state {
-		// Refused without ending the wait: a stray tab from an older attempt
-		// must not abort this one.
-		http.Error(w, "this sign-in belongs to another attempt", http.StatusBadRequest)
 		return
 	}
 	_, _ = fmt.Fprintf(w, page, "You're signed in.")
