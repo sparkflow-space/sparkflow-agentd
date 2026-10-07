@@ -14,8 +14,10 @@ proto-gen:
 	protoc \
 	  --go_out=. --go_opt=module=github.com/sparkflow-space/sparkflow-agentd \
 	  --go-grpc_out=. --go-grpc_opt=module=github.com/sparkflow-space/sparkflow-agentd \
+	  --go_opt=Magent/v1/hostchannel.proto=github.com/sparkflow-space/sparkflow-agentd/internal/generated/agent/v1\;agentv1 \
+	  --go-grpc_opt=Magent/v1/hostchannel.proto=github.com/sparkflow-space/sparkflow-agentd/internal/generated/agent/v1\;agentv1 \
 	  -I api/proto \
-	  api/proto/agentd/v1/agentd.proto
+	  api/proto/agent/v1/hostchannel.proto
 
 # tidy-check belongs in the gates because this repo is a PUBLISHED MODULE: a
 # direct dependency left marked `// indirect` is a go.mod that does not describe

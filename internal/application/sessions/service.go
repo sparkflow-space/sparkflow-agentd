@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
 )
@@ -24,8 +26,13 @@ type Service struct {
 	ids     IDs
 	catalog session.Catalog
 	env     session.EnvPolicy
-	root    string
-	limits  Limits
+	// home is the owner's home directory, symlink-resolved: every working
+	// folder must lie under it.
+	home   string
+	limits Limits
+	events Events
+	// briefWait/briefSettle time the typing of a session's first instruction.
+	briefWait, briefSettle time.Duration
 
 	mu       sync.RWMutex
 	sessions map[string]*session.Session
@@ -50,15 +57,23 @@ const (
 // positional parameters: every one of them is a port, and a mis-ordered pair of
 // interfaces compiles.
 type Deps struct {
-	Tmux          Tmux
-	Workspaces    Workspaces
-	Audit         Audit
-	Clock         Clock
-	IDs           IDs
-	Catalog       session.Catalog
-	Env           session.EnvPolicy
-	WorkspaceRoot string
-	Limits        Limits
+	Tmux       Tmux
+	Workspaces Workspaces
+	Audit      Audit
+	Clock      Clock
+	IDs        IDs
+	Catalog    session.Catalog
+	Env        session.EnvPolicy
+	// Home is the owner's home directory. Since AGENTD-003 the folder a
+	// session runs in is the one the person chose for the project, anywhere
+	// under their home — not under an operator-configured root.
+	Home   string
+	Limits Limits
+	Events Events
+	// BriefWait bounds how long Start waits for the agent's first output before
+	// typing the brief anyway; BriefSettle is the pause after that output, so
+	// the agent's prompt is ready. Zero means the defaults.
+	BriefWait, BriefSettle time.Duration
 }
 
 func New(d Deps) *Service {
@@ -68,10 +83,23 @@ func New(d Deps) *Service {
 	if d.Limits.Total <= 0 {
 		d.Limits.Total = DefaultTotal
 	}
+	if d.BriefWait <= 0 {
+		d.BriefWait = 20 * time.Second
+	}
+	if d.BriefSettle <= 0 {
+		d.BriefSettle = 1500 * time.Millisecond
+	}
+	home := d.Home
+	if d.Workspaces != nil && home != "" {
+		if real, err := d.Workspaces.Resolve(home); err == nil {
+			home = real
+		}
+	}
 	return &Service{
 		tmux: d.Tmux, dirs: d.Workspaces, audit: d.Audit, clock: d.Clock,
-		ids: d.IDs, catalog: d.Catalog, env: d.Env, root: d.WorkspaceRoot,
-		limits:   d.Limits,
+		ids: d.IDs, catalog: d.Catalog, env: d.Env, home: home,
+		limits: d.Limits, events: d.Events,
+		briefWait: d.BriefWait, briefSettle: d.BriefSettle,
 		sessions: map[string]*session.Session{},
 	}
 }
@@ -79,10 +107,17 @@ func New(d Deps) *Service {
 // StartParams is what a caller may influence. Note what is absent: any command
 // line. `Kind` indexes the daemon's allow-list.
 type StartParams struct {
-	Kind       string
-	Workspace  string
+	Kind string
+	// Folder is the working folder the person chose for the project on this
+	// host (from tenancy, via agent-sessions). It must lie under the owner's
+	// home; a git repository gets a fresh worktree inside it.
+	Folder string
+	// Label names the worktree and its branch — the server's session id.
+	Label      string
 	Env        []string
 	Cols, Rows int
+	// Brief is the first instruction, typed once the agent is up. Optional.
+	Brief string
 }
 
 // Start opens a session owned by `actor`.
@@ -95,8 +130,8 @@ type StartParams struct {
 func (s *Service) Start(ctx context.Context, actor session.Actor, p StartParams) (*session.Session, error) {
 	// Built from the RAW request, before validation, so a refusal is logged with
 	// what was actually asked for.
-	detail := fmt.Sprintf("kind=%q workspace=%q env=[%s] size=%dx%d",
-		p.Kind, p.Workspace, strings.Join(session.EnvNames(p.Env), " "), p.Cols, p.Rows)
+	detail := fmt.Sprintf("kind=%q folder=%q label=%q env=[%s] size=%dx%d brief=%dB",
+		p.Kind, p.Folder, p.Label, strings.Join(session.EnvNames(p.Env), " "), p.Cols, p.Rows, len(p.Brief))
 	fail := func(err error) (*session.Session, error) {
 		s.record(ctx, actor, "start", "", detail, err)
 		return nil, err
@@ -112,19 +147,24 @@ func (s *Service) Start(ctx context.Context, actor session.Actor, p StartParams)
 	if err := s.env.Validate(p.Env); err != nil {
 		return fail(err)
 	}
-	workspace, err := session.ValidateWorkspace(s.root, p.Workspace)
+	if err := session.ValidLabel(p.Label); err != nil {
+		return fail(err)
+	}
+	folder, err := s.folder(p.Folder)
 	if err != nil {
 		return fail(err)
 	}
-	// The lexical check says the path is inside the root; this says it exists.
-	// Residual TOCTOU is accepted and named: the directory could be removed
-	// between here and tmux, and tmux would then fall back to its own cwd. What
-	// this closes is the real case — a typo or a workspace nobody created.
-	if !s.dirs.IsDir(workspace) {
-		return fail(fmt.Errorf("%w: %s", session.ErrWorkspaceMissing, workspace))
-	}
 	if err := s.admit(actor.Subject); err != nil {
 		return fail(err)
+	}
+	// A repository gets a fresh worktree per session, so two sessions never
+	// share a working tree; a plain folder is used as it is.
+	workspace := folder
+	if s.dirs.IsGitRoot(folder) {
+		workspace = filepath.Join(folder, ".claude", "worktrees", p.Label)
+		if err := s.dirs.AddWorktree(ctx, folder, workspace, "agent/"+p.Label); err != nil {
+			return fail(err)
+		}
 	}
 
 	cols, rows := session.NormaliseSize(p.Cols, p.Rows)
@@ -154,6 +194,10 @@ func (s *Service) Start(ctx context.Context, actor session.Actor, p StartParams)
 	}
 
 	s.record(ctx, actor, "start", id, detail, nil)
+	s.emit(id, session.StateWorking)
+	if strings.TrimSpace(p.Brief) != "" {
+		go s.deliverBrief(actor, *sess, p.Brief)
+	}
 	cp := *sess
 	return &cp, nil
 }
@@ -237,6 +281,7 @@ func (s *Service) Signal(ctx context.Context, actor session.Actor, id string, si
 		return err
 	}
 	if sig == session.SignalKill {
+		defer s.emit(id, session.StateExited)
 		// The adapter's KILL is idempotent, so reaching here means the session
 		// is gone whether or not it was there a moment ago — which is exactly
 		// why the state is set unconditionally. An earlier version returned
@@ -307,17 +352,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		s.mu.Unlock()
 	}
 
-	var gone []string
+	var gone []*session.Session
 	s.mu.Lock()
 	for id, sess := range s.sessions {
 		if !alive[id] && sess.State != session.StateExited {
 			sess.State = session.StateExited
-			gone = append(gone, sess.TmuxName)
+			gone = append(gone, &session.Session{ID: id, TmuxName: sess.TmuxName})
 		}
 	}
 	s.mu.Unlock()
-	for _, name := range gone {
-		s.tmux.Release(name)
+	for _, g := range gone {
+		s.tmux.Release(g.TmuxName)
+		s.emit(g.ID, session.StateExited)
 	}
 
 	if unattributed > 0 {
@@ -402,11 +448,108 @@ func classify(err error) Outcome {
 	for _, sentinel := range []error{
 		session.ErrUnknownKind, session.ErrWorkspaceEscapes, session.ErrWorkspaceEmpty,
 		session.ErrWorkspaceMissing, session.ErrEnvNotAllowed, session.ErrUnknownSignal,
-		session.ErrTooManySessions, session.ErrNotFound, session.ErrNoActor,
+		session.ErrTooManySessions, session.ErrNotFound, session.ErrNoActor, session.ErrBadLabel,
 	} {
 		if errors.Is(err, sentinel) {
 			return OutcomeRefused
 		}
 	}
 	return OutcomeError
+}
+
+// folder resolves and checks a working folder: under the owner's home after
+// every symlink is resolved, and an existing directory.
+func (s *Service) folder(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", session.ErrWorkspaceEmpty
+	}
+	if !filepath.IsAbs(raw) {
+		return "", fmt.Errorf("%w: %q is not absolute", session.ErrWorkspaceEscapes, raw)
+	}
+	if s.home == "" {
+		return "", fmt.Errorf("%w: the daemon does not know its owner's home", session.ErrWorkspaceEscapes)
+	}
+	real, err := s.dirs.Resolve(raw)
+	if err != nil {
+		// A path that does not resolve does not exist (or is unreadable).
+		return "", fmt.Errorf("%w: %s", session.ErrWorkspaceMissing, raw)
+	}
+	clean, err := session.ValidateWorkspace(s.home, real)
+	if err != nil {
+		return "", err
+	}
+	if clean == s.home {
+		return "", fmt.Errorf("%w: the home directory itself is not a working folder — choose a folder inside it", session.ErrWorkspaceEscapes)
+	}
+	// Residual TOCTOU is accepted and named: the directory could go between
+	// here and tmux, which would then fall back to its own cwd.
+	if !s.dirs.IsDir(clean) {
+		return "", fmt.Errorf("%w: %s", session.ErrWorkspaceMissing, clean)
+	}
+	return clean, nil
+}
+
+// ListDirs lists one level of the owner's home tree for the working-folder
+// picker. Empty path = the home itself. Audited: the names of a person's
+// folders leave this device only through here.
+func (s *Service) ListDirs(ctx context.Context, actor session.Actor, path string) (string, []session.Dir, error) {
+	detail := fmt.Sprintf("path=%q", path)
+	fail := func(err error) (string, []session.Dir, error) {
+		s.record(ctx, actor, "listdirs", "", detail, err)
+		return "", nil, err
+	}
+	if !actor.Valid() {
+		return fail(session.ErrNoActor)
+	}
+	target := s.home
+	if strings.TrimSpace(path) != "" {
+		if !filepath.IsAbs(path) {
+			return fail(fmt.Errorf("%w: %q is not absolute", session.ErrWorkspaceEscapes, path))
+		}
+		real, err := s.dirs.Resolve(path)
+		if err != nil {
+			return fail(fmt.Errorf("%w: %s", session.ErrWorkspaceMissing, path))
+		}
+		if target, err = session.ValidateWorkspace(s.home, real); err != nil {
+			return fail(err)
+		}
+	}
+	dirs, err := s.dirs.ListDirs(target)
+	if err != nil {
+		return fail(fmt.Errorf("%w: %s", session.ErrWorkspaceMissing, target))
+	}
+	s.record(ctx, actor, "listdirs", "", fmt.Sprintf("%s returned=%d", detail, len(dirs)), nil)
+	return target, dirs, nil
+}
+
+// deliverBrief types a session's first instruction once the agent is up: after
+// its first output (its banner, its prompt) and a short settle, or after
+// briefWait with no output at all. Typed into the pane, so the agent receives
+// it exactly as if the person had.
+func (s *Service) deliverBrief(actor session.Actor, sess session.Session, brief string) {
+	ctx, cancel := context.WithTimeout(context.Background(), s.briefWait+s.briefSettle+30*time.Second)
+	defer cancel()
+	wait, stop := context.WithTimeout(ctx, s.briefWait)
+	if ch, err := s.tmux.Subscribe(wait, sess.TmuxName, 0); err == nil {
+		select {
+		case <-ch:
+		case <-wait.Done():
+		}
+	}
+	stop()
+	t := time.NewTimer(s.briefSettle)
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+		t.Stop()
+		return
+	}
+	err := s.tmux.SendKeys(ctx, sess.PaneID, brief, true)
+	s.record(ctx, actor, "brief", sess.ID, fmt.Sprintf("%dB", len(brief)), err)
+}
+
+func (s *Service) emit(id string, st session.State) {
+	if s.events != nil {
+		s.events.SessionState(id, st)
+	}
 }

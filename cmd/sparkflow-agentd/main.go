@@ -1,39 +1,43 @@
-// Command sparkflow-agentd owns CLI-agent sessions on a host.
+// Command sparkflow-agentd runs CLI coding agents on this device for one
+// person, driven from Sparkflow through an OUTBOUND channel — it opens no port.
 //
-//	sparkflow-agentd -config /etc/sparkflow-agentd/config.json
+//	sparkflow-agentd init [--debug-dev] …   sign in, name and register this device, offer a user service
+//	sparkflow-agentd run                    hold the channel (what the service executes)
+//	sparkflow-agentd service install|uninstall|status
+//	sparkflow-agentd status                 who this device is enrolled to, and whether it runs
+//	sparkflow-agentd version
 //
-// See the README for what it is and the security notes for what it refuses.
+// See the README for the walk-through and CLAUDE.md for what it refuses.
 package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-
+	"github.com/sparkflow-space/sparkflow-agentd/internal/application/enrol"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/application/sessions"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/core"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/host"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/domain/session"
-	agentdv1 "github.com/sparkflow-space/sparkflow-agentd/internal/generated/agentd/v1"
-	handler "github.com/sparkflow-space/sparkflow-agentd/internal/handler/grpc"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/handler/channel"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/credfile"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/hostchannel"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/hostfs"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/hostinfo"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/lockfile"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/terminal"
 	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/tmux"
-	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/tokenauth"
+	"github.com/sparkflow-space/sparkflow-agentd/internal/infra/zitadel"
 )
 
 // version is stamped at release time by GoReleaser (-X main.version={{.Tag}}).
@@ -56,144 +60,236 @@ func versionString() string {
 	return version
 }
 
-func main() {
-	cfgPath := flag.String("config", "", "path to config.json")
-	showVersion := flag.Bool("version", false, "print the version and exit")
-	flag.Parse()
+// exitPermanent tells the service manager not to restart (RestartPreventExitStatus=3).
+const exitPermanent = 3
 
-	if *showVersion {
+const usage = `sparkflow-agentd — run CLI coding agents on this device, driven from Sparkflow.
+
+  sparkflow-agentd init [flags]       sign in, name this device and register it as one of your hosts
+  sparkflow-agentd run                hold the channel to Sparkflow (what the service runs)
+  sparkflow-agentd service install    run it with the system (a user service)
+  sparkflow-agentd service uninstall
+  sparkflow-agentd service status
+  sparkflow-agentd status             show this device's enrolment
+  sparkflow-agentd version
+
+Run "sparkflow-agentd init -h" for init's flags.
+`
+
+func main() {
+	args := os.Args[1:]
+	// -version is kept from v0.1.0.
+	if len(args) == 1 && (args[0] == "-version" || args[0] == "--version" || args[0] == "version") {
 		fmt.Println(versionString())
 		return
 	}
-
-	if err := run(*cfgPath); err != nil {
-		log.Fatalf("sparkflow-agentd: %v", err)
+	if len(args) == 0 {
+		fmt.Print(usage)
+		os.Exit(2)
 	}
-}
-
-func run(cfgPath string) error {
-	cfg, err := core.Load(cfgPath)
-	if err != nil {
-		return err
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Auth is built BEFORE the listener opens: a daemon that cannot verify tokens
-	// must not accept a connection at all, and there is no degraded mode — the
-	// degraded mode here is "run anybody's code".
-	verifier, err := tokenauth.New(ctx, cfg.Auth.JWKSURL, cfg.Auth.Issuer, cfg.Auth.Audience,
-		func(url string, err error) {
-			log.Printf("warning: refreshing the JWKS at %s failed: %v; token verification may start failing", url, err)
-		})
+	var err error
+	switch args[0] {
+	case "init":
+		err = cmdInit(ctx, args[1:])
+	case "run":
+		err = cmdRun(ctx)
+	case "service":
+		err = cmdService(ctx, args[1:])
+	case "status":
+		err = cmdStatus(ctx)
+	case "-h", "--help", "help":
+		fmt.Print(usage)
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", args[0], usage)
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sparkflow-agentd: "+err.Error())
+		if errors.Is(err, channel.ErrPermanent) {
+			os.Exit(exitPermanent)
+		}
+		os.Exit(1)
+	}
+}
+
+func configDir() string {
+	d, err := credfile.DefaultDir()
+	if err != nil {
+		log.Fatalf("sparkflow-agentd: cannot find a config directory: %v", err)
+	}
+	return d
+}
+
+func credStore() credfile.Store {
+	return credfile.Store{Path: filepath.Join(configDir(), "credentials.json")}
+}
+
+func loadConfig() (*core.Config, error) {
+	return core.Load(filepath.Join(configDir(), "config.json"))
+}
+
+func cmdInit(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	debugDev := fs.Bool("debug-dev", false, "Target the development deployment instead of production (server, issuer AND client id together).")
+	server := fs.String("server", "", "Sparkflow server URL. Overrides --debug-dev.")
+	issuer := fs.String("issuer", "", "OIDC issuer URL. Overrides --debug-dev.")
+	clientID := fs.String("client-id", "", "Public OIDC client id of sparkflow-agentd. Overrides --debug-dev.")
+	manual := fs.Bool("manual", false, "Sign in through the server's code page and paste the code (browser on another machine).")
+	noBrowser := fs.Bool("no-browser", false, "Don't try to open a browser — just print the sign-in link (over SSH / headless).")
+	name := fs.String("name", "", "Name this host without being asked.")
+	fresh := fs.Bool("new", false, "Drop this device's existing enrolment and register it as a new host.")
+	noService := fs.Bool("no-service", false, "Don't install a user service; print the commands instead.")
+	yes := fs.Bool("yes", false, "Accept every default without asking.")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	d := host.DeploymentFor(*debugDev)
+	if *server != "" {
+		d.ServerURL = *server
+	}
+	if *issuer != "" {
+		d.IssuerURL = *issuer
+	}
+	if *clientID != "" {
+		d.ClientID = *clientID
+	}
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
+	svc, err := serviceManager()
+	if err != nil {
+		return err
+	}
+	_, inSSH := os.LookupEnv("SSH_CONNECTION")
+	term := terminal.New(os.Stdin, os.Stdout)
+	_, err = enrol.Run(ctx, enrol.Deps{
+		IdP: idpAdapter{zitadel.New()}, Redirects: redirects{}, Prompter: term, Browser: systemBrowser{},
+		Machine:   machine{info: hostinfo.New(), kinds: cfg.Kinds},
+		Registrar: registrar{}, Store: storeAdapter{credStore()}, Service: serviceAdapter{svc},
+	}, enrol.Options{
+		Deployment: d, Manual: *manual, NoBrowser: *noBrowser || inSSH, Name: *name, New: *fresh,
+		NoService: *noService, Yes: *yes, Version: versionString(),
+	})
+	return err
+}
+
+func cmdRun(ctx context.Context) error {
+	store := credStore()
+	creds, err := store.Load()
+	if err != nil {
+		return err
+	}
+	if err := creds.Validate(); err != nil {
+		return err
+	}
+	lock, err := lockfile.Acquire(store.Path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	target, secure, err := hostchannel.Target(creds.Deployment.ServerURL)
+	if err != nil {
+		return err
+	}
+
+	tokens := hostchannel.NewTokens(*creds, zitadel.New(), store.Save)
+	dialer := &hostchannel.Dialer{Target: target, Secure: secure, Tokens: tokens}
+	defer dialer.Close()
 
 	cli := tmux.NewCLI(cfg.TmuxBin)
 	control := tmux.NewControl(cfg.TmuxBin, cfg.StreamBuffer, cfg.StreamBufferBytes, log.Printf)
 	defer control.Close()
 
+	audit := newAuditLog(os.Stdout)
+	runner := &channel.Runner{
+		Audit: audit, Owner: creds.OwnerSub, HostID: creds.HostID, Version: versionString(),
+		Kinds:    hostinfo.New().KindsOnPath(cfg.Kinds),
+		Classify: hostchannel.Permanent,
+		Dial:     func(ctx context.Context) (channel.Stream, error) { return dialer.Connect(ctx) },
+	}
 	svc := sessions.New(sessions.Deps{
-		Tmux:          combined{CLI: cli, Control: control},
-		Workspaces:    hostfs.Dirs{},
-		Audit:         newAuditLog(os.Stdout),
-		Clock:         realClock{},
-		IDs:           randomIDs{},
-		Catalog:       session.Catalog(cfg.Kinds),
-		Env:           cfg.EnvPolicy(),
-		WorkspaceRoot: cfg.WorkspaceRoot,
-		Limits:        sessions.Limits{PerOwner: cfg.MaxSessionsPerOwner, Total: cfg.MaxSessions},
+		Tmux: combined{CLI: cli, Control: control}, Workspaces: hostfs.Dirs{}, Audit: audit,
+		Clock: realClock{}, IDs: randomIDs{}, Catalog: session.Catalog(cfg.Kinds), Env: cfg.EnvPolicy(),
+		Home: home, Events: runner,
+		Limits: sessions.Limits{PerOwner: cfg.MaxSessionsPerOwner, Total: cfg.MaxSessions},
 	})
+	runner.Sessions = svc
 
-	// tmux outlives this process, so the first thing we do is find out what is
-	// actually running rather than assume we start from nothing.
+	// tmux outlives this process: find out what is actually running first.
 	if err := svc.Reconcile(ctx); err != nil {
 		log.Printf("warning: reconciling existing tmux sessions failed: %v", err)
 	}
-	// And keep doing it: a session that exits on its own — the agent finished, the
-	// host ran out of memory, somebody killed it by hand — would otherwise read as
-	// alive until the next restart.
 	go reconcileLoop(ctx, svc, time.Duration(cfg.ReconcileSeconds)*time.Second)
 
-	unary, stream := handler.Interceptors(verifier, refusalLog{})
-	opts := []grpc.ServerOption{grpc.UnaryInterceptor(unary), grpc.StreamInterceptor(stream)}
-	creds, err := serverCreds(cfg.TLS)
+	log.Printf("sparkflow-agentd %s: host %q (%s) for %s → %s; kinds %v; no listening port",
+		versionString(), creds.HostName, creds.HostID, ownerName(creds), creds.Deployment.ServerURL, runner.Kinds)
+	return runner.Run(ctx)
+}
+
+func ownerName(c *host.Credentials) string {
+	if c.OwnerEmail != "" {
+		return c.OwnerEmail
+	}
+	return c.OwnerSub
+}
+
+func cmdService(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: sparkflow-agentd service install|uninstall|status")
+	}
+	m, err := serviceManager()
 	if err != nil {
 		return err
 	}
-	if creds != nil {
-		opts = append(opts, grpc.Creds(creds))
-	}
-	srv := grpc.NewServer(opts...)
-	agentdv1.RegisterAgentDaemonServer(srv, handler.NewServer(svc))
-
-	lis, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
-	}
-	log.Printf("sparkflow-agentd listening on %s (%s); kinds: %v; workspace root: %s; env prefixes: %v",
-		cfg.Listen, transportName(creds), session.Catalog(cfg.Kinds).Kinds(),
-		cfg.WorkspaceRoot, cfg.EnvAllowPrefixes)
-
-	go func() {
-		<-ctx.Done()
-		// GracefulStop lets in-flight streams finish — but it BLOCKS until they
-		// do, and gRPC does not cancel a handler's context, so a single open
-		// Stream would keep the process alive forever and a second SIGTERM would
-		// be a no-op (NotifyContext's context is already cancelled). Hence the
-		// deadline: ask nicely, then stop.
-		//
-		// The tmux sessions themselves are deliberately left alone and re-adopted
-		// next boot.
-		done := make(chan struct{})
-		go func() { srv.GracefulStop(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			log.Printf("warning: a stream did not finish in 10s; stopping anyway")
-			srv.Stop()
+	switch args[0] {
+	case "install":
+		if _, err := credStore().Load(); err != nil {
+			return err // nothing to run before init
 		}
-	}()
-	return srv.Serve(lis)
+		res, err := m.Install(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Installed and started: " + res.UnitPath)
+		for _, n := range res.Notes {
+			fmt.Println("Note: " + n)
+		}
+	case "uninstall":
+		if err := m.Uninstall(ctx); err != nil {
+			return err
+		}
+		fmt.Println("The service is stopped and removed. The enrolment is kept; revoke the host in \"My hosts\" if this device is done with Sparkflow.")
+	case "status":
+		fmt.Println(m.Status(ctx))
+	default:
+		return fmt.Errorf("unknown service command %q", args[0])
+	}
+	return nil
 }
 
-// serverCreds builds mutual TLS, or returns nil when the configuration has
-// explicitly allowed plaintext on loopback (core.Config refuses every other
-// plaintext case).
-func serverCreds(c core.TLSConfig) (credentials.TransportCredentials, error) {
-	if !c.Enabled() {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
+func cmdStatus(ctx context.Context) error {
+	c, err := credStore().Load()
 	if err != nil {
-		return nil, fmt.Errorf("agentd: loading the server certificate: %w", err)
+		return err
 	}
-	pem, err := os.ReadFile(c.ClientCAFile)
-	if err != nil {
-		return nil, fmt.Errorf("agentd: reading the client CA: %w", err)
+	fmt.Printf("host:    %s (%s)\nowner:   %s\nserver:  %s\nversion: %s\n", c.HostName, c.HostID, ownerName(c), c.Deployment.ServerURL, versionString())
+	if m, err := serviceManager(); err == nil {
+		fmt.Printf("service: %s\n", m.Status(ctx))
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("agentd: the client CA file %q contains no certificate", c.ClientCAFile)
-	}
-	return credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		// RequireAndVerify, not VerifyIfGiven: the caller is one known service
-		// holding a certificate from a private CA, and anything else has no
-		// business opening this port.
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs:  pool,
-		MinVersion: tls.VersionTLS13,
-	}), nil
-}
-
-func transportName(c credentials.TransportCredentials) string {
-	if c == nil {
-		return "PLAINTEXT — loopback only"
-	}
-	return "mutual TLS"
+	return nil
 }
 
 func reconcileLoop(ctx context.Context, svc *sessions.Service, every time.Duration) {
@@ -214,59 +310,4 @@ func reconcileLoop(ctx context.Context, svc *sessions.Service, every time.Durati
 	}
 }
 
-// combined joins the two tmux adapters into the single port the use cases want.
-type combined struct {
-	*tmux.CLI
-	*tmux.Control
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
-type randomIDs struct{}
-
-func (randomIDs) New() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// A session id must be unpredictable: it is part of the tmux session
-		// name, and a guessable one lets a caller aim at somebody else's session
-		// by id. Failing here is correct.
-		log.Fatalf("sparkflow-agentd: cannot read random bytes: %v", err)
-	}
-	return hex.EncodeToString(b[:])
-}
-
-// auditLog writes one line per attempted command.
-//
-// The mutex and the single Write are the point: a `send` detail can be a whole
-// kanban-card brief, and two concurrent fmt.Fprintf calls longer than PIPE_BUF
-// interleave in journald — producing a log that is worse than a short one
-// because it looks complete.
-type auditLog struct {
-	mu sync.Mutex
-	w  interface{ Write([]byte) (int, error) }
-}
-
-func newAuditLog(w interface{ Write([]byte) (int, error) }) *auditLog {
-	return &auditLog{w: w}
-}
-
-func (a *auditLog) Record(_ context.Context, e sessions.AuditEvent) {
-	var b strings.Builder
-	fmt.Fprintf(&b, "audit ts=%s actor=%q action=%s outcome=%s session=%s detail=%q",
-		time.Now().UTC().Format(time.RFC3339), e.Actor, e.Action, e.Outcome, e.SessionID, e.Detail)
-	if e.Reason != "" {
-		fmt.Fprintf(&b, " reason=%q", e.Reason)
-	}
-	b.WriteByte('\n')
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, _ = a.w.Write([]byte(b.String()))
-}
-
-type refusalLog struct{}
-
-func (refusalLog) Refused(reason string, err error) {
-	log.Printf("refused: %s (%v)", reason, err)
-}
+var _ io.Writer = os.Stdout

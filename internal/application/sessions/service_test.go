@@ -3,6 +3,7 @@ package sessions_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -137,9 +138,45 @@ func (s *seqIDs) New() string {
 	return "aaaaaaaaaaaaaa" + string(rune('0'+s.n/10)) + string(rune('0'+s.n%10))
 }
 
-type dirs map[string]bool
+// fakeDirs is a filesystem: directories, symlinks, repositories.
+type fakeDirs struct {
+	mu        sync.Mutex
+	dirs      map[string]bool
+	links     map[string]string // path → where it really points
+	git       map[string]bool
+	worktrees []string
+	listing   []session.Dir
+}
 
-func (d dirs) IsDir(p string) bool { return d[p] }
+func (d *fakeDirs) IsDir(p string) bool { return d.dirs[p] }
+func (d *fakeDirs) Resolve(p string) (string, error) {
+	c := filepath.Clean(p)
+	if real, ok := d.links[c]; ok {
+		return real, nil
+	}
+	if !d.dirs[c] {
+		return "", errors.New("no such file")
+	}
+	return c, nil
+}
+func (d *fakeDirs) IsGitRoot(p string) bool { return d.git[p] }
+func (d *fakeDirs) ListDirs(string) ([]session.Dir, error) {
+	return d.listing, nil
+}
+func (d *fakeDirs) AddWorktree(_ context.Context, repo, path, branch string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.worktrees = append(d.worktrees, repo+"|"+path+"|"+branch)
+	return nil
+}
+
+func newDirs() *fakeDirs {
+	return &fakeDirs{
+		dirs:  map[string]bool{"/home/u-evil": true, "/home/u": true, "/home/u/p1": true, "/home/u/p2": true, "/home/u/repo": true, "/etc": true},
+		links: map[string]string{"/home/u/link-out": "/etc"},
+		git:   map[string]bool{"/home/u/repo": true},
+	}
+}
 
 // --- harness -------------------------------------------------------------
 
@@ -155,14 +192,14 @@ func newHarness(t *testing.T, opts ...func(*sessions.Deps)) harness {
 	au := &fakeAudit{}
 	d := sessions.Deps{
 		Tmux:       tm,
-		Workspaces: dirs{"/srv/agents/p1": true, "/srv/agents/p2": true},
+		Workspaces: newDirs(),
 		Audit:      au,
 		Clock:      fixedClock{},
 		IDs:        &seqIDs{},
 		Catalog:    session.Catalog{"claude": {"claude"}, "qwen": {"qwen", "--tui"}},
 		Env:        session.EnvPolicy{AllowPrefixes: []string{"SPARKFLOW_"}},
 
-		WorkspaceRoot: "/srv/agents",
+		Home: "/home/u",
 	}
 	for _, o := range opts {
 		o(&d)
@@ -178,7 +215,7 @@ var (
 func okStart(t *testing.T, h harness, actor session.Actor) *session.Session {
 	t.Helper()
 	s, err := h.svc.Start(context.Background(), actor, sessions.StartParams{
-		Kind: "claude", Workspace: "/srv/agents/p1",
+		Kind: "claude", Label: "s1", Folder: "/home/u/p1",
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
@@ -219,13 +256,13 @@ func TestRefusalsAreAudited(t *testing.T) {
 		params   sessions.StartParams
 		sentinel error
 	}{
-		{"unknown kind", sessions.StartParams{Kind: "bash", Workspace: "/srv/agents/p1"}, session.ErrUnknownKind},
-		{"escaping workspace", sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/../../etc"}, session.ErrWorkspaceEscapes},
-		{"sibling of the root", sessions.StartParams{Kind: "claude", Workspace: "/srv/agents-evil"}, session.ErrWorkspaceEscapes},
-		{"missing workspace", sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/nope"}, session.ErrWorkspaceMissing},
-		{"injected env", sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/p1",
+		{"unknown kind", sessions.StartParams{Kind: "bash", Label: "s1", Folder: "/home/u/p1"}, session.ErrUnknownKind},
+		{"escaping workspace", sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/../../etc"}, session.ErrWorkspaceEscapes},
+		{"sibling of the home", sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u-evil"}, session.ErrWorkspaceEscapes},
+		{"missing workspace", sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/nope"}, session.ErrWorkspaceMissing},
+		{"injected env", sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/p1",
 			Env: []string{"LD_PRELOAD=/srv/agents/p1/x.so"}}, session.ErrEnvNotAllowed},
-		{"unprefixed env", sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/p1",
+		{"unprefixed env", sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/p1",
 			Env: []string{"FOO=bar"}}, session.ErrEnvNotAllowed},
 	}
 	for _, tc := range cases {
@@ -252,7 +289,7 @@ func TestRefusalsAreAudited(t *testing.T) {
 func TestAuditLogsEnvNamesNotValues(t *testing.T) {
 	h := newHarness(t)
 	_, err := h.svc.Start(context.Background(), alice, sessions.StartParams{
-		Kind: "claude", Workspace: "/srv/agents/p1",
+		Kind: "claude", Label: "s1", Folder: "/home/u/p1",
 		Env: []string{"SPARKFLOW_TOKEN=s3cr3t-value"},
 	})
 	if err != nil {
@@ -270,7 +307,7 @@ func TestAuditLogsEnvNamesNotValues(t *testing.T) {
 func TestAllowedEnvReachesTmux(t *testing.T) {
 	h := newHarness(t)
 	if _, err := h.svc.Start(context.Background(), alice, sessions.StartParams{
-		Kind: "claude", Workspace: "/srv/agents/p1", Env: []string{"SPARKFLOW_PROJECT=p1"},
+		Kind: "claude", Label: "s1", Folder: "/home/u/p1", Env: []string{"SPARKFLOW_PROJECT=p1"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +353,7 @@ func TestSessionsAreScopedToTheirOwner(t *testing.T) {
 func TestStartRefusesTheZeroActor(t *testing.T) {
 	h := newHarness(t)
 	_, err := h.svc.Start(context.Background(), session.Actor{}, sessions.StartParams{
-		Kind: "claude", Workspace: "/srv/agents/p1",
+		Kind: "claude", Label: "s1", Folder: "/home/u/p1",
 	})
 	if !errors.Is(err, session.ErrNoActor) {
 		t.Fatalf("err = %v, want ErrNoActor", err)
@@ -330,12 +367,12 @@ func TestLimits(t *testing.T) {
 	ctx := context.Background()
 	okStart(t, h, alice)
 	okStart(t, h, alice)
-	if _, err := h.svc.Start(ctx, alice, sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/p1"}); !errors.Is(err, session.ErrTooManySessions) {
+	if _, err := h.svc.Start(ctx, alice, sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/p1"}); !errors.Is(err, session.ErrTooManySessions) {
 		t.Fatalf("third session for one owner: err = %v, want ErrTooManySessions", err)
 	}
 	// Another person still gets one, up to the host total.
 	okStart(t, h, bob)
-	if _, err := h.svc.Start(ctx, bob, sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/p1"}); !errors.Is(err, session.ErrTooManySessions) {
+	if _, err := h.svc.Start(ctx, bob, sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/p1"}); !errors.Is(err, session.ErrTooManySessions) {
 		t.Fatalf("fourth session on the host: err = %v, want ErrTooManySessions", err)
 	}
 	// A killed session frees its slot.
@@ -343,7 +380,7 @@ func TestLimits(t *testing.T) {
 	if err := h.svc.Signal(ctx, alice, mine[0].ID, session.SignalKill); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.Start(ctx, bob, sessions.StartParams{Kind: "claude", Workspace: "/srv/agents/p1"}); err != nil {
+	if _, err := h.svc.Start(ctx, bob, sessions.StartParams{Kind: "claude", Label: "s1", Folder: "/home/u/p1"}); err != nil {
 		t.Fatalf("after a kill freed a slot: %v", err)
 	}
 }
@@ -401,7 +438,7 @@ func TestSendAuditsTheTextAndAddressesThePane(t *testing.T) {
 func TestReconcileAdoptsOnlyWellFormedNamesAndKeepsOwnership(t *testing.T) {
 	h := newHarness(t)
 	h.tmux.live = []session.Live{
-		{TmuxName: "sfagent-0123456789abcdef", PaneID: "%3", Owner: alice.Subject, Kind: "claude", Workspace: "/srv/agents/p1"},
+		{TmuxName: "sfagent-0123456789abcdef", PaneID: "%3", Owner: alice.Subject, Kind: "claude", Workspace: "/home/u/p1"},
 		{TmuxName: "sfagent-a", PaneID: "%4", Owner: bob.Subject},                 // too short: a prefix target would hit a real session
 		{TmuxName: "sfagent-0123456789abcdefX", PaneID: "%5", Owner: bob.Subject}, // too long
 		{TmuxName: "someone-elses-work", PaneID: "%6"},                            // not ours
@@ -413,7 +450,7 @@ func TestReconcileAdoptsOnlyWellFormedNamesAndKeepsOwnership(t *testing.T) {
 	}
 
 	mine := h.svc.List(ctx, alice)
-	if len(mine) != 1 || mine[0].ID != "0123456789abcdef" || mine[0].PaneID != "%3" || mine[0].Workspace != "/srv/agents/p1" {
+	if len(mine) != 1 || mine[0].ID != "0123456789abcdef" || mine[0].PaneID != "%3" || mine[0].Workspace != "/home/u/p1" {
 		t.Fatalf("alice's adopted sessions = %+v", mine)
 	}
 	if got := h.svc.List(ctx, bob); len(got) != 0 {
@@ -453,4 +490,129 @@ func TestReconcileRetiresVanishedSessions(t *testing.T) {
 	if len(h.tmux.released) != 1 {
 		t.Errorf("released = %v, want the dead session's buffer dropped", h.tmux.released)
 	}
+}
+
+// --- AGENTD-003: the working folder, the brief, the folder picker, events ---
+
+func TestStart_FolderRules(t *testing.T) {
+	cases := []struct {
+		name   string
+		folder string
+		label  string
+		want   error
+	}{
+		{"a symlink inside the home pointing out of it", "/home/u/link-out", "s1", session.ErrWorkspaceEscapes},
+		{"the home itself", "/home/u", "s1", session.ErrWorkspaceEscapes},
+		{"relative", "p1", "s1", session.ErrWorkspaceEscapes},
+		{"empty", "", "s1", session.ErrWorkspaceEmpty},
+		{"a label that is a path", "/home/u/p1", "../x", session.ErrBadLabel},
+		{"a label with a slash", "/home/u/p1", "a/b", session.ErrBadLabel},
+		{"a label starting with a dash", "/home/u/p1", "-x", session.ErrBadLabel},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			_, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: c.folder, Label: c.label})
+			if !errors.Is(err, c.want) {
+				t.Fatalf("got %v, want %v", err, c.want)
+			}
+		})
+	}
+}
+
+func TestStart_ARepositoryGetsAFreshWorktree(t *testing.T) {
+	d := newDirs()
+	h := newHarness(t, func(x *sessions.Deps) { x.Workspaces = d })
+	s, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/repo", Label: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Workspace != "/home/u/repo/.claude/worktrees/abc123" {
+		t.Errorf("workspace = %q", s.Workspace)
+	}
+	if len(d.worktrees) != 1 || d.worktrees[0] != "/home/u/repo|/home/u/repo/.claude/worktrees/abc123|agent/abc123" {
+		t.Errorf("worktrees: %v", d.worktrees)
+	}
+	// A plain folder is used as it is, no worktree.
+	s2, _ := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/p1", Label: "def456"})
+	if s2.Workspace != "/home/u/p1" || len(d.worktrees) != 1 {
+		t.Errorf("plain folder: %q, worktrees %v", s2.Workspace, d.worktrees)
+	}
+}
+
+type recEvents struct {
+	mu sync.Mutex
+	ev []string
+}
+
+func (r *recEvents) SessionState(id string, st session.State) {
+	r.mu.Lock()
+	r.ev = append(r.ev, id+"="+st.String())
+	r.mu.Unlock()
+}
+
+func TestStart_TypesTheBriefOnceTheAgentIsUp_AndEmitsEvents(t *testing.T) {
+	ev := &recEvents{}
+	h := newHarness(t, func(x *sessions.Deps) {
+		x.Events = ev
+		x.BriefWait, x.BriefSettle = 200*time.Millisecond, time.Millisecond
+	})
+	s, err := h.svc.Start(context.Background(), alice, sessions.StartParams{Kind: "claude", Folder: "/home/u/p1", Label: "s1", Brief: "# TSK-1: do it"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(strings.Join(h.tmux.sentTexts(), "|"), "# TSK-1: do it") {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(strings.Join(h.tmux.sentTexts(), "|"), "# TSK-1: do it") {
+		t.Fatalf("the brief was never typed: %v", h.tmux.sentTexts())
+	}
+	if err := h.svc.Signal(context.Background(), alice, s.ID, session.SignalKill); err != nil {
+		t.Fatal(err)
+	}
+	ev.mu.Lock()
+	got := strings.Join(ev.ev, ",")
+	ev.mu.Unlock()
+	if got != s.ID+"=working,"+s.ID+"=exited" {
+		t.Errorf("events: %s", got)
+	}
+}
+
+func TestListDirs_InsideTheHomeOnly(t *testing.T) {
+	d := newDirs()
+	d.listing = []session.Dir{{Name: "repo", Git: true}, {Name: "p1"}}
+	h := newHarness(t, func(x *sessions.Deps) { x.Workspaces = d })
+	path, dirs, err := h.svc.ListDirs(context.Background(), alice, "")
+	if err != nil || path != "/home/u" || len(dirs) != 2 || !dirs[0].Git {
+		t.Fatalf("home: %q %v %v", path, dirs, err)
+	}
+	for _, bad := range []string{"/etc", "/home/u/link-out", "/home/u/../../etc", "relative"} {
+		if _, _, err := h.svc.ListDirs(context.Background(), alice, bad); !errors.Is(err, session.ErrWorkspaceEscapes) && !errors.Is(err, session.ErrWorkspaceMissing) {
+			t.Errorf("ListDirs(%q) must be refused, got %v", bad, err)
+		}
+	}
+	if _, _, err := h.svc.ListDirs(context.Background(), session.Actor{}, ""); !errors.Is(err, session.ErrNoActor) {
+		t.Errorf("no actor: %v", err)
+	}
+	if !h.audit.has("listdirs", sessions.OutcomeRefused) || !h.audit.has("listdirs", sessions.OutcomeOK) {
+		t.Error("browsing must be audited, refusals included")
+	}
+}
+
+func (f *fakeTmux) sentTexts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keys...)
+}
+
+func (a *fakeAudit) has(action string, o sessions.Outcome) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.events {
+		if e.Action == action && e.Outcome == o {
+			return true
+		}
+	}
+	return false
 }
